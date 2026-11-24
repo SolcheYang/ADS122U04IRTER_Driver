@@ -23,4 +23,4 @@ _tests/_data/
 .ads122u04_write_test
 
 # local executable copies (the repo may still track the historical exe)
-ADS122U04_ADC_Tool.exe
+MagSensor.exe

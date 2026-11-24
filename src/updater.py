@@ -33,7 +33,7 @@ from pathlib import Path
 MAX_MANIFEST_BYTES = 512 * 1024
 MAX_UPDATE_BYTES = 256 * 1024 * 1024
 USER_AGENT = "ADS122U04-ADC-Tool-Updater/1.0"
-EXE_NAME = "ADS122U04_ADC_Tool.exe"
+EXE_NAME = "MagSensor.exe"
 
 _VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -199,7 +199,7 @@ def download_update(info: UpdateInfo, dest_dir: Path, progress=None,
     _validate_https(info.url, "下载地址")
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    final = dest_dir / "ADS122U04_ADC_Tool_update.exe"
+    final = dest_dir / "MagSensor_update.exe"
     part = dest_dir / "download.part"
     req = urllib.request.Request(
         info.url,

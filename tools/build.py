@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 BUILD = ROOT / "build"
 DIST = ROOT / "dist"
-APP_NAME = "ADS122U04_ADC_Tool"
+APP_NAME = "MagSensor"
 EXE_NAME = APP_NAME + ".exe"
 TAG_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)$")
 
@@ -105,7 +105,7 @@ VSVersionInfo(
         StringStruct('FileVersion', '{major}.{minor}.{patch}.0'),
         StringStruct('InternalName', '{APP_NAME}'),
         StringStruct('OriginalFilename', '{EXE_NAME}'),
-        StringStruct('ProductName', 'ADS122U04 UART ADC acquisition tool'),
+        StringStruct('ProductName', 'MagSensor acquisition tool'),
         StringStruct('ProductVersion', '{major}.{minor}.{patch}.0'),
         StringStruct('Comments', 'build {version_text}')
       ])

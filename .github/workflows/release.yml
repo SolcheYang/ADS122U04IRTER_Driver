@@ -46,7 +46,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/ADS122U04_ADC_Tool.exe
+            dist/MagSensor.exe
             dist/latest.json
           body_path: dist/release_notes.md
           fail_on_unmatched_files: true

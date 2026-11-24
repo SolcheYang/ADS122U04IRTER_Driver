@@ -37,6 +37,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import formula as formula_engine
+
 try:
     import serial
     from serial.tools import list_ports
@@ -56,7 +58,7 @@ else:
     UPDATE_IMPORT_ERROR = None
 
 
-APP_NAME = "ADS122U04 串口采集工具"
+APP_NAME = "MagSensor"
 APP_VERSION = "1.0.0"
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
@@ -108,6 +110,13 @@ DR_TABLE = {
     True: [40, 90, 180, 350, 660, 1200, 2000],
 }
 
+FORMULA_VARIABLE_TYPES = {
+    "i": "int", "t": "float", "code": "int", "vin": "float",
+    "ain0": "float", "rate": "float", "lsb": "float",
+    "vref": "float", "gain": "int", "fs": "float",
+    "ain1": "float", "avdd": "float", "refp": "float",
+}
+
 COL_BG = "#17181d"
 COL_PANEL = "#1f2128"
 COL_PANEL2 = "#262933"
@@ -122,6 +131,7 @@ COL_ERR = "#ef4444"
 COL_PLOT_BG = "#111318"
 COL_GRID = "#242833"
 COL_TRACE = "#38e1c6"
+COL_TRACE2 = "#f5a97f"
 
 
 # ---------------------------------------------------------------------------
@@ -570,21 +580,13 @@ class SessionStats:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.codes = array("i")
-        self.total = 0
-        self.min_code = None
-        self.max_code = None
-        self.sum_codes = 0
-        self.last_code = 0
-        self.last_counter = None
-        self.dropped = 0
-        self.errors = 0
-        self.resyncs = 0
-        self.rate = 0.0
+        self.reset()
 
     def reset(self):
         with self.lock:
             self.codes = array("i")
+            self.xvals = array("d")
+            self.fvals = array("d")
             self.total = 0
             self.min_code = None
             self.max_code = None
@@ -595,12 +597,25 @@ class SessionStats:
             self.errors = 0
             self.resyncs = 0
             self.rate = 0.0
+            self.formula_errors = 0
 
-    def add(self, code, counter=None):
+    def add(self, code, counter=None, xval=None, fval=None):
+        try:
+            xv = float(xval) if xval is not None else float("nan")
+        except Exception:
+            xv = float("nan")
+        try:
+            fv = float(fval) if fval is not None else float("nan")
+        except Exception:
+            fv = float("nan")
         with self.lock:
             self.codes.append(code)
+            self.xvals.append(xv)
+            self.fvals.append(fv)
             if len(self.codes) > self.MAX_BUFFER:
                 del self.codes[:50000]
+                del self.xvals[:50000]
+                del self.fvals[:50000]
             self.total += 1
             if self.min_code is None or code < self.min_code:
                 self.min_code = code
@@ -610,7 +625,8 @@ class SessionStats:
             self.last_code = code
             self.last_counter = counter
 
-    def note(self, dropped=None, errors=None, resyncs=None, rate=None):
+    def note(self, dropped=None, errors=None, resyncs=None, rate=None,
+             formula_errors=None):
         with self.lock:
             if dropped is not None:
                 self.dropped = dropped
@@ -620,6 +636,8 @@ class SessionStats:
                 self.resyncs = resyncs
             if rate is not None:
                 self.rate = rate
+            if formula_errors is not None:
+                self.formula_errors = formula_errors
 
     def quick(self):
         with self.lock:
@@ -635,45 +653,92 @@ class SessionStats:
                 "errors": self.errors,
                 "resyncs": self.resyncs,
                 "rate": self.rate,
+                "formula_errors": self.formula_errors,
             }
+
+    def _stats_locked(self):
+        return {
+            "total": self.total,
+            "buffered": len(self.codes),
+            "min": self.min_code,
+            "max": self.max_code,
+            "sum": self.sum_codes,
+            "last": self.last_code,
+            "counter": self.last_counter,
+            "dropped": self.dropped,
+            "errors": self.errors,
+            "resyncs": self.resyncs,
+            "rate": self.rate,
+            "formula_errors": self.formula_errors,
+        }
+
+    def _slice_locked(self, start_abs, end_abs, max_points):
+        """Slice by absolute sample index. Caller holds self.lock."""
+        buffered = len(self.codes)
+        first_abs = self.total - buffered
+        if buffered <= 0:
+            s = e = 0
+            codes = array("i")
+            xs = array("d")
+            fs = array("d")
+            window = 0
+            step = 1
+        else:
+            try:
+                s = max(first_abs, int(start_abs))
+                e = min(self.total - 1, int(end_abs))
+            except Exception:
+                s, e = self.total, self.total - 1
+            if e < s:
+                codes = array("i")
+                xs = array("d")
+                fs = array("d")
+                window = 0
+                step = 1
+            else:
+                off_s = s - first_abs
+                off_e = e - first_abs + 1
+                window = off_e - off_s
+                step = (int(math.ceil(window / float(max_points)))
+                        if max_points and window > max_points else 1)
+                codes = self.codes[off_s:off_e:step]
+                xs = self.xvals[off_s:off_e:step]
+                fs = self.fvals[off_s:off_e:step]
+        data = self._stats_locked()
+        data.update({
+            "start_index": s,
+            "window": window,
+            "step": step,
+            "codes": codes,
+            "xvals": xs,
+            "fvals": fs,
+        })
+        return data
 
     def snapshot(self, tail_count=0, max_points=6000):
         with self.lock:
             buffered = len(self.codes)
-            step = 1
-            window = 0
-            arr = array("i")
-            if tail_count and tail_count > 0:
+            if tail_count and tail_count > 0 and buffered > 0:
                 window = min(int(tail_count), buffered)
-                if window > 0:
-                    arr = self.codes[buffered - window:]
-                    if max_points and window > max_points:
-                        step = int(math.ceil(window / float(max_points)))
-                        arr = arr[::step]
-            return {
-                "total": self.total,
-                "buffered": buffered,
-                "min": self.min_code,
-                "max": self.max_code,
-                "sum": self.sum_codes,
-                "last": self.last_code,
-                "counter": self.last_counter,
-                "dropped": self.dropped,
-                "errors": self.errors,
-                "resyncs": self.resyncs,
-                "rate": self.rate,
-                "window": window,
-                "step": step,
-                "codes": arr,
-            }
+                start = self.total - window
+                return self._slice_locked(start, self.total - 1, max_points)
+            return self._slice_locked(self.total, self.total - 1, max_points)
+
+    def snapshot_range(self, start_index, end_index, max_points=6000):
+        with self.lock:
+            return self._slice_locked(start_index, end_index, max_points)
 
 
 class Recorder:
-    def __init__(self, folder: Path, cfg: DeviceConfig, meta: dict, rate: float):
+    def __init__(self, folder: Path, cfg: DeviceConfig, meta: dict, rate: float,
+                 formula_text: str = "", x_formula: str = "", x_unit: str = ""):
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         self.rate = float(rate) if rate else 1.0
-        base = f"ADS122U04_{stamp}"
+        self.formula_text = formula_text
+        self.x_formula = x_formula
+        self.x_unit = x_unit
+        base = f"MagSensor_{stamp}"
         self.raw_path = folder / f"{base}_raw.bin"
         self.csv_path = folder / f"{base}_samples.csv"
         self.json_path = folder / f"{base}_config.json"
@@ -682,7 +747,8 @@ class Recorder:
                         buffering=1 << 16)
         self.writer = csv.writer(self.csv)
         self.writer.writerow(["index", "t_s", "host_time_s", "counter",
-                              "code", "vin_V", "ain0_V"])
+                              "code", "vin_V", "ain0_V", "x_value",
+                              "formula_value"])
         self.rows = 0
         with open(self.json_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -692,12 +758,23 @@ class Recorder:
         self.raw.write(data)
         self.raw_bytes += len(data)
 
-    def add(self, index, host_t, counter, code, vin, ain0):
+    def add(self, index, host_t, counter, code, vin, ain0, xval=None, fval=None):
+        def _num(v):
+            if v is None:
+                return ""
+            try:
+                v = float(v)
+            except Exception:
+                return ""
+            if not math.isfinite(v):
+                return ""
+            return f"{v:.9g}"
         self.writer.writerow([index, f"{index / self.rate:.6f}",
                               f"{host_t:.6f}",
                               "" if counter is None else counter, code,
                               f"{vin:.9f}",
-                              "" if ain0 is None else f"{ain0:.9f}"])
+                              "" if ain0 is None else f"{ain0:.9f}",
+                              _num(xval), _num(fval)])
         self.rows += 1
         if self.rows % 512 == 0:
             self.csv.flush()
@@ -724,9 +801,6 @@ class Recorder:
         return paths
 
 
-# ---------------------------------------------------------------------------
-# Serial / acquisition worker
-# ---------------------------------------------------------------------------
 class SerialWorker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -759,6 +833,15 @@ class SerialWorker(threading.Thread):
         }
         self._lsb = 2.4414e-7
         self._ain1 = 0.0
+        self._mux = 0
+        self._formula_rate = 1.0
+        self._f_expr = None
+        self._x_expr = None
+        self._formula_ctx = {}
+        self._formula_errors = 0
+        self._formula_text = ""
+        self._x_formula_text = ""
+        self._x_unit = "s"
         self._acq_t0 = 0.0
         self._rate_n = 0
         self._rate_t = time.monotonic()
@@ -953,6 +1036,34 @@ class SerialWorker(threading.Thread):
         self._lsb = float(meta.get("lsb", 2.4414e-7)) or 2.4414e-7
         self._ain1 = float(meta.get("ain1", 0.0))
         self._mux = cfg.mux
+        self._formula_text = (meta.get("formula") or "ain0").strip()
+        self._x_formula_text = (meta.get("x_formula") or "t").strip()
+        self._x_unit = (meta.get("x_unit") or "s").strip() or "s"
+        self._formula_rate = float(cfg.data_rate) or 1.0
+        cc = meta.get("formula_context") or {}
+        try:
+            self._formula_ctx = {
+                "rate": float(cc.get("rate", cfg.data_rate)),
+                "lsb": float(cc.get("lsb", self._lsb)),
+                "vref": float(cc.get("vref", 2.048)),
+                "gain": int(cc.get("gain", cfg.effective()[0])),
+                "fs": float(cc.get("fs", 0.128)),
+                "ain1": float(cc.get("ain1", self._ain1)),
+                "avdd": float(cc.get("avdd", 3.3)),
+                "refp": float(cc.get("refp", 2.048)),
+            }
+            self._f_expr = formula_engine.compile_expr(
+                self._formula_text, FORMULA_VARIABLE_TYPES)
+            self._x_expr = formula_engine.compile_expr(
+                self._x_formula_text, FORMULA_VARIABLE_TYPES)
+        except Exception as exc:
+            self._f_expr = None
+            self._x_expr = None
+            self.log("error", f"公式无效：{exc}")
+            self._set_state(settings_status="公式错误", settings_ok=False,
+                            message="公式错误，未开始采集")
+            return
+        self._formula_errors = 0
         self._acq_t0 = time.monotonic()
         self._rate_n = 0
         self._rate_t = time.monotonic()
@@ -976,7 +1087,10 @@ class SerialWorker(threading.Thread):
 
         if record:
             try:
-                self.recorder = Recorder(Path(folder), cfg, meta, cfg.data_rate)
+                self.recorder = Recorder(Path(folder), cfg, meta, cfg.data_rate,
+                                         self._formula_text,
+                                         self._x_formula_text,
+                                         self._x_unit)
                 self.log("info", f"原始码流文件：{self.recorder.raw_path}")
                 self.log("info", f"解码 CSV 文件：{self.recorder.csv_path}")
             except Exception as exc:
@@ -1008,6 +1122,8 @@ class SerialWorker(threading.Thread):
                         message=f"采集中 · {cfg.data_rate} SPS")
         self.log("ok", f"开始采集 · {cfg.description()}")
         self.log("info", f"帧格式：{cfg.frame_description()}")
+        self.log("info", f"公式波形：f = {self._formula_text} ; "
+                          f"x = {self._x_formula_text} [{self._x_unit}]")
 
     def _do_stop(self, quiet=False):
         was = self.streaming
@@ -1147,10 +1263,31 @@ class SerialWorker(threading.Thread):
             ain0 = self._ain1 - vin       # reversed channel AIN1 - AIN0
         else:
             ain0 = None                   # AIN0 absolute is not derivable
-        self.stats.add(code, counter)
+        idx = self._sample_index
+        ain0_val = ain0 if ain0 is not None else float("nan")
+        ctx = self._formula_ctx
+        ctx["i"] = idx
+        ctx["t"] = idx / self._formula_rate if self._formula_rate else 0.0
+        ctx["code"] = code
+        ctx["vin"] = vin
+        ctx["ain0"] = ain0_val
+        fval = float("nan")
+        xval = float("nan")
+        try:
+            if self._f_expr is not None:
+                fval = self._f_expr.eval_float(ctx)
+            if self._x_expr is not None:
+                xval = self._x_expr.eval_float(ctx)
+        except Exception:
+            pass
+        if not (math.isfinite(fval) and math.isfinite(xval)):
+            self._formula_errors += 1
+        self.stats.note(formula_errors=self._formula_errors)
+        self.stats.add(code, counter, xval, fval)
         if self.recorder is not None:
             try:
-                self.recorder.add(self._sample_index, host_t, counter, code, vin, ain0)
+                self.recorder.add(self._sample_index, host_t, counter, code,
+                                  vin, ain0, xval, fval)
             except Exception as exc:
                 self.log("error", f"写入 CSV 失败：{exc}")
                 try:
@@ -1175,7 +1312,8 @@ class SerialWorker(threading.Thread):
         self.stats.note(rate=self._rate_ema,
                         dropped=self.decoder.dropped if self.decoder else 0,
                         errors=self.decoder.errors if self.decoder else 0,
-                        resyncs=self.decoder.resyncs if self.decoder else 0)
+                        resyncs=self.decoder.resyncs if self.decoder else 0,
+                        formula_errors=self._formula_errors)
 
     # -- simulator ---------------------------------------------------------
     def _sim_pump(self):
@@ -1239,6 +1377,22 @@ class ScrollFrame(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# Waveform view state
+# ---------------------------------------------------------------------------
+class PlotState:
+    def __init__(self, canvas, auto_var, kind):
+        self.canvas = canvas
+        self.auto_var = auto_var
+        self.kind = kind          # "raw" or "formula"
+        self.y_view = None        # (ymin, ymax)
+        self.index_view = None    # (start_abs_index, end_abs_index)
+        self.last = None          # mapping from the last draw
+        self.selecting = False
+        self.box = None
+        self.box_rect = None
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 class App:
@@ -1263,6 +1417,13 @@ class App:
         self._last_state = {}
         self._port_map = {}
         self._last_valid = None
+        self.raw_plot = None
+        self.formula_plot = None
+        self.formula_var = tk.StringVar(value="ain0")
+        self.x_formula_var = tk.StringVar(value="t")
+        self.x_unit_var = tk.StringVar(value="s")
+        self.formula_autoscale_var = tk.BooleanVar(value=True)
+        self.formula_status_var = tk.StringVar(value="")
         self.no_update_check = bool(no_update_check or demo)
         self.updated = bool(updated)
         self.update_queue = queue.Queue()
@@ -1278,9 +1439,11 @@ class App:
         self._refresh_ports()
         self._on_config_widget_change()
         self._update_range()
+        self._validate_formula()
         self._refresh_state(self.worker.get_state())
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(300, self._init_plot_sash)
         self.root.after(60, self._tick)
         if demo:
             self.root.after(500, self._demo_connect)
@@ -1328,6 +1491,10 @@ class App:
             "timebase": self.timebase_var.get(),
             "autoscale": bool(self.autoscale_var.get()),
             "plot_mode": self.plot_mode_var.get(),
+            "formula": self.formula_var.get().strip(),
+            "x_formula": self.x_formula_var.get().strip(),
+            "x_unit": self.x_unit_var.get().strip(),
+            "formula_autoscale": bool(self.formula_autoscale_var.get()),
             "record": bool(self.record_var.get()),
             "data_dir": self.data_dir_var.get(),
         }
@@ -1365,6 +1532,10 @@ class App:
             self.autoscale_var.set(bool(s.get("autoscale", True)))
             mode = s.get("plot_mode", "abs")
             self.plot_mode_var.set(mode if mode in ("abs", "diff") else "abs")
+            self.formula_var.set(str(s.get("formula", "ain0")))
+            self.x_formula_var.set(str(s.get("x_formula", "t")))
+            self.x_unit_var.set(str(s.get("x_unit", "s")))
+            self.formula_autoscale_var.set(bool(s.get("formula_autoscale", True)))
             self.record_var.set(bool(s.get("record", True)))
             data_dir = s.get("data_dir") or default_data_dir()
             self.data_dir_var.set(data_dir)
@@ -1516,9 +1687,9 @@ class App:
         header.pack(fill="x", padx=int(16 * s), pady=(int(10 * s), int(8 * s)))
         left = tk.Frame(header, bg=COL_BG)
         left.pack(side="left")
-        tk.Label(left, text="ADS122U04  24 位 ΔΣ ADC 串口采集", bg=COL_BG,
+        tk.Label(left, text="MagSensor · 24 位 ADC 采集", bg=COL_BG,
                  fg=COL_FG, font=(FONT, 15, "bold")).pack(anchor="w")
-        tk.Label(left, text="UART 2-wire · 自动波特率 · 图形化配置 · 原始码流 · 实时波形",
+        tk.Label(left, text="MagSensor · UART 2-wire · 原始波形与自定义公式波形 · 原始码流",
                  bg=COL_BG, fg=COL_MUTED, font=(FONT, 9)).pack(anchor="w", pady=(2, 0))
 
         right = tk.Frame(header, bg=COL_BG)
@@ -1729,13 +1900,23 @@ class App:
                   self.cm_combo, self.vref_combo, self.integ_combo):
             w.bind("<MouseWheel>", self._combo_wheel)
 
+    def _init_plot_sash(self):
+        try:
+            h = self.plots_pane.winfo_height()
+            if h > 200:
+                self.plots_pane.sash_place(0, 0, int(h * 0.45))
+        except Exception:
+            pass
+
     def _build_right(self, parent):
         s = self.ui_scale
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
         # ---- range calculator ----
         self.calc_lf = ttk.Labelframe(
             parent, text=" 测量范围计算 · AIN0 − AIN1（AIN1 = 信号偏置） ",
             style="Panel.TLabelframe")
-        self.calc_lf.pack(fill="x")
+        self.calc_lf.grid(row=0, column=0, sticky="ew")
         body = tk.Frame(self.calc_lf, bg=COL_PANEL)
         body.pack(fill="x", padx=12, pady=(8, 10))
 
@@ -1781,20 +1962,23 @@ class App:
         self.range_bar.pack(fill="x", pady=(6, 0))
         self.range_bar.bind("<Configure>", lambda e: self._draw_range_bar())
 
-        # ---- waveform ----
-        self.plot_lf = ttk.Labelframe(parent, text=" 实时波形 ",
+        # ---- raw waveform ----
+        self.plots_pane = tk.PanedWindow(
+            parent, orient=tk.VERTICAL, bg=COL_BG,
+            sashwidth=max(4, int(6 * s)), sashpad=0, bd=0, relief="flat")
+        self.plots_pane.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        self.plot_lf = ttk.Labelframe(self.plots_pane, text=" 实时波形 · 原始 ",
                                       style="Panel.TLabelframe")
-        self.plot_lf.pack(fill="both", expand=True, pady=(8, 8))
 
         tb = tk.Frame(self.plot_lf, bg=COL_PANEL)
         tb.pack(fill="x", padx=10, pady=(6, 2))
         self.plot_mode_var = tk.StringVar(value="abs")
         ttk.Radiobutton(tb, text="AIN0 绝对电压", value="abs",
                         variable=self.plot_mode_var,
-                        command=self._on_display_change).pack(side="left")
+                        command=self._on_raw_mode_changed).pack(side="left")
         ttk.Radiobutton(tb, text="差分 VIN", value="diff",
                         variable=self.plot_mode_var,
-                        command=self._on_display_change).pack(side="left", padx=(8, 0))
+                        command=self._on_raw_mode_changed).pack(side="left", padx=(8, 0))
 
         tk.Label(tb, text="时间窗", bg=COL_PANEL, fg=COL_MUTED,
                  font=(FONT, 8)).pack(side="left", padx=(18, 5))
@@ -1804,36 +1988,120 @@ class App:
             values=["0.5 s", "1 s", "2 s", "5 s", "10 s", "30 s", "全部"])
         self.timebase_combo.pack(side="left")
         self.timebase_combo.bind("<<ComboboxSelected>>",
-                                 lambda e: self._on_display_change())
+                                 self._on_timebase_changed)
         self.timebase_combo.bind("<MouseWheel>", self._block_wheel)
 
         self.autoscale_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(tb, text="自动 Y", variable=self.autoscale_var,
-                        command=self._on_display_change).pack(side="left", padx=(14, 0))
+                        command=self._on_raw_auto_toggle).pack(side="left", padx=(14, 0))
 
         self.pause_btn = ttk.Button(tb, text="暂停", style="Small.TButton",
                                     command=self._toggle_pause)
         self.pause_btn.pack(side="right")
         ttk.Button(tb, text="清空", style="Small.TButton",
                    command=self._clear_clicked).pack(side="right", padx=(0, 5))
+        ttk.Button(tb, text="复位", style="Small.TButton",
+                   command=self._reset_raw_view).pack(side="right", padx=(0, 5))
 
+        stats_row = tk.Frame(self.plot_lf, bg=COL_PANEL)
+        stats_row.pack(fill="x", padx=12, pady=(2, 4))
         self.stats_var = tk.StringVar(value="样本 0 · 速率 — · 最新 —")
-        tk.Label(self.plot_lf, textvariable=self.stats_var, bg=COL_PANEL,
-                 fg=COL_MUTED, font=(MONO, 8), anchor="w").pack(
-                     fill="x", padx=12, pady=(2, 4))
+        tk.Label(stats_row, textvariable=self.stats_var, bg=COL_PANEL,
+                 fg=COL_MUTED, font=(MONO, 8), anchor="w").pack(side="left")
+        tk.Label(stats_row, text="滚轮缩Y(关自动) · 拖动框选",
+                 bg=COL_PANEL, fg="#5d6472", font=(FONT, 7)).pack(side="right")
 
         self.canvas = tk.Canvas(self.plot_lf, bg=COL_PLOT_BG,
-                                highlightthickness=0, bd=0)
+                                highlightthickness=0, bd=0,
+                                height=int(110 * s))
         self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 9))
         self.canvas.bind("<Configure>", self._on_canvas_cfg)
+        self.canvas.bind("<MouseWheel>",
+                         lambda e: self._on_plot_wheel(self.raw_plot, e))
+        self.canvas.bind("<ButtonPress-1>",
+                         lambda e: self._on_plot_press(self.raw_plot, e))
+        self.canvas.bind("<B1-Motion>",
+                         lambda e: self._on_plot_drag(self.raw_plot, e))
+        self.canvas.bind("<ButtonRelease-1>",
+                         lambda e: self._on_plot_release(self.raw_plot, e))
+
+        # ---- formula waveform ----
+        self.formula_lf = ttk.Labelframe(
+            self.plots_pane, text=" 公式波形 · C 表达式（开始采集时生效） ",
+            style="Panel.TLabelframe")
+
+        ftb = tk.Frame(self.formula_lf, bg=COL_PANEL)
+        ftb.pack(fill="x", padx=10, pady=(6, 2))
+
+        frow = tk.Frame(ftb, bg=COL_PANEL)
+        frow.pack(fill="x")
+        tk.Label(frow, text="f(x) =", bg=COL_PANEL, fg=COL_MUTED,
+                 font=(MONO, 9)).pack(side="left")
+        self.formula_entry = ttk.Entry(frow, textvariable=self.formula_var)
+        self.formula_entry.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        frow2 = tk.Frame(ftb, bg=COL_PANEL)
+        frow2.pack(fill="x", pady=(4, 0))
+        tk.Label(frow2, text="X 单位", bg=COL_PANEL, fg=COL_MUTED,
+                 font=(FONT, 8)).pack(side="left")
+        self.x_unit_entry = ttk.Entry(frow2, textvariable=self.x_unit_var, width=7)
+        self.x_unit_entry.pack(side="left", padx=(3, 10))
+        tk.Label(frow2, text="X =", bg=COL_PANEL, fg=COL_MUTED,
+                 font=(MONO, 9)).pack(side="left")
+        self.x_formula_entry = ttk.Entry(frow2, textvariable=self.x_formula_var)
+        self.x_formula_entry.pack(side="left", fill="x", expand=True, padx=(3, 10))
+        ttk.Checkbutton(frow2, text="自动 Y", variable=self.formula_autoscale_var,
+                        command=self._on_formula_auto_toggle).pack(side="left")
+        ttk.Button(frow2, text="复位", style="Small.TButton",
+                   command=self._reset_formula_view).pack(side="left", padx=(6, 0))
+
+        self.formula_status_lbl = tk.Label(
+            ftb, textvariable=self.formula_status_var, bg=COL_PANEL,
+            fg=COL_MUTED, font=(FONT, 8), anchor="w", justify="left",
+            wraplength=int(850 * s))
+        self.formula_status_lbl.pack(fill="x", padx=2, pady=(2, 0))
+        tk.Label(ftb, text=("变量: i, t, code, vin, ain0, rate, lsb, vref, gain, "
+                            "fs, ain1, avdd, refp · 函数: sqrt/sin/cos/pow/..."
+                            " · 支持 C 整数/浮点、位运算、条件表达式"),
+                 bg=COL_PANEL, fg="#5d6472", font=(FONT, 7), anchor="w",
+                 justify="left", wraplength=int(850 * s)).pack(
+                     fill="x", padx=2, pady=(1, 0))
+
+        self.formula_canvas = tk.Canvas(self.formula_lf, bg=COL_PLOT_BG,
+                                        highlightthickness=0, bd=0,
+                                        height=int(110 * s))
+        self.formula_canvas.pack(fill="both", expand=True, padx=10,
+                                 pady=(4, 9))
+        self.formula_canvas.bind("<Configure>", self._on_formula_canvas_cfg)
+        self.formula_canvas.bind(
+            "<MouseWheel>", lambda e: self._on_plot_wheel(self.formula_plot, e))
+        self.formula_canvas.bind(
+            "<ButtonPress-1>", lambda e: self._on_plot_press(self.formula_plot, e))
+        self.formula_canvas.bind(
+            "<B1-Motion>", lambda e: self._on_plot_drag(self.formula_plot, e))
+        self.formula_canvas.bind(
+            "<ButtonRelease-1>", lambda e: self._on_plot_release(self.formula_plot, e))
+
+        self.raw_plot = PlotState(self.canvas, self.autoscale_var, "raw")
+        self.formula_plot = PlotState(self.formula_canvas,
+                                      self.formula_autoscale_var, "formula")
+
+        for var in (self.formula_var, self.x_formula_var):
+            var.trace_add("write", lambda *a: self._on_formula_text_changed())
+        self.x_unit_var.trace_add("write", lambda *a: self._on_display_change())
+
+        self.plots_pane.add(self.plot_lf, minsize=int(170 * s),
+                            stretch="always")
+        self.plots_pane.add(self.formula_lf, minsize=int(240 * s),
+                            stretch="always")
 
         # ---- log ----
         self.log_lf = ttk.Labelframe(parent, text=" 事件日志 ",
                                      style="Panel.TLabelframe")
-        self.log_lf.pack(fill="x")
+        self.log_lf.grid(row=2, column=0, sticky="ew")
         logbody = tk.Frame(self.log_lf, bg=COL_PANEL)
         logbody.pack(fill="both", expand=True, padx=8, pady=(5, 7))
-        self.log_text = tk.Text(logbody, height=5, bg="#14161b", fg="#c7ccd6",
+        self.log_text = tk.Text(logbody, height=3, bg="#14161b", fg="#c7ccd6",
                                 insertbackground=COL_FG, relief="flat",
                                 bd=0, wrap="word", font=(MONO, 8),
                                 padx=8, pady=4, state="disabled")
@@ -1851,12 +2119,203 @@ class App:
         self.log_text.tag_configure("error", foreground="#ff7b7b")
         self.log_text.tag_configure("time", foreground="#5d6472")
 
-    # -- small UI callbacks -------------------------------------------------
+    # -- small UI callbacks / waveform views ------------------------------
     def _on_canvas_cfg(self, _=None):
+        self._plot_dirty = True
+
+    def _on_formula_canvas_cfg(self, _=None):
         self._plot_dirty = True
 
     def _on_display_change(self):
         self._plot_dirty = True
+
+    def _on_formula_text_changed(self):
+        self._validate_formula()
+        self._plot_dirty = True
+
+    def _validate_formula(self):
+        """Compile f(x) and X expressions for validation and the start action."""
+        try:
+            formula_engine.compile_expr(self.formula_var.get().strip(),
+                                        FORMULA_VARIABLE_TYPES)
+            formula_engine.compile_expr(self.x_formula_var.get().strip(),
+                                        FORMULA_VARIABLE_TYPES)
+            msg = "公式有效（修改后重新开始采集生效）"
+            try:
+                self.formula_status_var.set(msg)
+                self.formula_status_lbl.configure(fg=COL_GREEN)
+            except Exception:
+                pass
+            return True, ""
+        except Exception as exc:
+            msg = f"公式错误：{exc}"
+            try:
+                self.formula_status_var.set(msg)
+                self.formula_status_lbl.configure(fg=COL_ERR)
+            except Exception:
+                pass
+            return False, str(exc)
+
+    def _on_raw_mode_changed(self):
+        if self.raw_plot is not None:
+            self.raw_plot.y_view = None
+            self.raw_plot.index_view = None
+        self._plot_dirty = True
+
+    def _on_timebase_changed(self, _=None):
+        for st in (self.raw_plot, self.formula_plot):
+            if st is not None:
+                st.index_view = None
+        self._plot_dirty = True
+
+    def _on_raw_auto_toggle(self):
+        st = self.raw_plot
+        if st is None:
+            return
+        if st.auto_var.get():
+            st.y_view = None
+        elif st.last is not None:
+            st.y_view = (st.last["ymin"], st.last["ymax"])
+        self._plot_dirty = True
+
+    def _on_formula_auto_toggle(self):
+        st = self.formula_plot
+        if st is None:
+            return
+        if st.auto_var.get():
+            st.y_view = None
+        elif st.last is not None:
+            st.y_view = (st.last["ymin"], st.last["ymax"])
+        self._plot_dirty = True
+
+    def _reset_raw_view(self):
+        st = self.raw_plot
+        if st is None:
+            return
+        st.y_view = None
+        st.index_view = None
+        st.auto_var.set(True)
+        self._plot_dirty = True
+
+    def _reset_formula_view(self):
+        st = self.formula_plot
+        if st is None:
+            return
+        st.y_view = None
+        st.index_view = None
+        st.auto_var.set(True)
+        self._plot_dirty = True
+
+    def _plot_rate_value(self):
+        try:
+            return max(1.0, float(self._ui_config().data_rate))
+        except Exception:
+            return 1.0
+
+    def _on_plot_press(self, state, event):
+        if state is None or state.last is None:
+            return "break"
+        l = state.last
+        if not (l["ml"] <= event.x <= l["ml"] + l["pw"] and
+                l["mt"] <= event.y <= l["mt"] + l["ph"]):
+            return "break"
+        state.selecting = True
+        state.box = (event.x, event.y)
+        state.box_rect = state.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y, outline=COL_ACCENT,
+            dash=(3, 2), width=1)
+        return "break"
+
+    def _on_plot_drag(self, state, event):
+        if state is None or not state.selecting or state.box is None:
+            return "break"
+        x0, y0 = state.box
+        if state.box_rect is not None:
+            state.canvas.coords(state.box_rect, x0, y0, event.x, event.y)
+        return "break"
+
+    def _on_plot_release(self, state, event):
+        if state is None or not state.selecting:
+            return "break"
+        state.selecting = False
+        x0, y0 = state.box or (event.x, event.y)
+        state.box = None
+        if state.box_rect is not None:
+            try:
+                state.canvas.delete(state.box_rect)
+            except Exception:
+                pass
+            state.box_rect = None
+        l = state.last
+        x1, y1 = event.x, event.y
+        if l is None or abs(x1 - x0) < 6 or abs(y1 - y0) < 6:
+            self._plot_dirty = True
+            return "break"
+        ml, mt, pw, ph = l["ml"], l["mt"], l["pw"], l["ph"]
+        x0c = min(max(min(x0, x1), ml), ml + pw)
+        x1c = min(max(max(x0, x1), ml), ml + pw)
+        y0c = min(max(min(y0, y1), mt), mt + ph)
+        y1c = min(max(max(y0, y1), mt), mt + ph)
+        if x1c - x0c < 3 or y1c - y0c < 3:
+            self._plot_dirty = True
+            return "break"
+        xa = l["xmin"] + (x0c - ml) / max(1, pw) * (l["xmax"] - l["xmin"])
+        xb = l["xmin"] + (x1c - ml) / max(1, pw) * (l["xmax"] - l["xmin"])
+        ya = l["ymax"] - (y0c - mt) / max(1, ph) * (l["ymax"] - l["ymin"])
+        yb = l["ymax"] - (y1c - mt) / max(1, ph) * (l["ymax"] - l["ymin"])
+        ymin_sel, ymax_sel = min(ya, yb), max(ya, yb)
+        if ymax_sel <= ymin_sel:
+            self._plot_dirty = True
+            return "break"
+        state.y_view = (ymin_sel, ymax_sel)
+        state.auto_var.set(False)
+        if state.kind == "raw":
+            rate = l.get("rate") or 1.0
+            ia = int(round(min(xa, xb) * rate))
+            ib = int(round(max(xa, xb) * rate))
+            first_i = l.get("first_index", 0)
+            last_i = l.get("last_index", 0)
+            ia = min(max(ia, first_i), last_i)
+            ib = min(max(ib, first_i), last_i)
+            if ib - ia < 1:
+                ia = max(first_i, ia - 1)
+                ib = min(last_i, ib + 1)
+            state.index_view = (ia, ib)
+        else:
+            ids = [p[0] for p in l.get("pts", [])
+                   if min(xa, xb) <= p[1] <= max(xa, xb)]
+            if not ids:
+                self._plot_dirty = True
+                return "break"
+            state.index_view = (min(ids), max(ids))
+        self._plot_dirty = True
+        return "break"
+
+    def _on_plot_wheel(self, state, event):
+        if state is None or state.last is None:
+            return "break"
+        if state.auto_var.get():
+            return "break"  # 关闭自动 Y 后才允许滚轮缩放
+        l = state.last
+        if not (l["ml"] <= event.x <= l["ml"] + l["pw"] and
+                l["mt"] <= event.y <= l["mt"] + l["ph"]):
+            return "break"
+        if state.y_view is not None:
+            ymin, ymax = state.y_view
+        else:
+            ymin, ymax = l["ymin"], l["ymax"]
+        span = ymax - ymin
+        if span <= 0:
+            return "break"
+        cursor = ymax - (event.y - l["mt"]) / max(1, l["ph"]) * span
+        factor = 0.82 if getattr(event, "delta", 0) > 0 else 1.0 / 0.82
+        new_span = span * factor
+        new_span = max(min(new_span, 1e15), max(1e-15, abs(cursor) * 1e-12))
+        ratio = (cursor - ymin) / span
+        new_min = cursor - ratio * new_span
+        state.y_view = (new_min, new_min + new_span)
+        self._plot_dirty = True
+        return "break"
 
     def _combo_wheel(self, event):
         """Scroll the sidebar instead of changing the combobox value."""
@@ -1881,6 +2340,12 @@ class App:
 
     def _clear_clicked(self):
         self.worker.clear_stats()
+        for st in (self.raw_plot, self.formula_plot):
+            if st is not None:
+                st.y_view = None
+                st.index_view = None
+                st.last = None
+                st.auto_var.set(True)
         self._plot_dirty = True
 
     def _choose_dir(self):
@@ -2191,6 +2656,10 @@ class App:
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"输入参数无效：\n{exc}")
             return
+        ok_formula, formula_err = self._validate_formula()
+        if not ok_formula:
+            messagebox.showerror(APP_NAME, "公式错误：\n" + formula_err)
+            return
 
         if not st.get("sim"):
             try:
@@ -2221,6 +2690,9 @@ class App:
             "tool": APP_NAME, "version": APP_VERSION,
             "created": datetime.now().isoformat(timespec="seconds"),
             "port": st.get("port", ""), "baud": st.get("baud", 0),
+            "lsb": info.lsb, "ain1": ain1,
+            "vref": info.vref, "gain": info.gain, "fs": info.fs,
+            "avdd": avdd, "refp": refp,
             "device_config": {
                 "mux": cfg.mux, "gain": cfg.gain, "data_rate": cfg.data_rate,
                 "turbo": cfg.turbo, "continuous": cfg.continuous,
@@ -2231,6 +2703,14 @@ class App:
             },
             "frame": {"length": cfg.frame_len,
                       "description": cfg.frame_description()},
+            "formula": self.formula_var.get().strip(),
+            "x_formula": self.x_formula_var.get().strip(),
+            "x_unit": self.x_unit_var.get().strip() or "s",
+            "formula_context": {
+                "rate": cfg.data_rate, "lsb": info.lsb, "vref": info.vref,
+                "gain": info.gain, "fs": info.fs, "ain1": ain1,
+                "avdd": avdd, "refp": refp,
+            },
             "range": {
                 "refp_V": refp, "ain1_V": ain1, "avdd_V": avdd,
                 "vref_V": info.vref, "gain": info.gain,
@@ -2393,7 +2873,7 @@ class App:
 
         s = self.ui_scale
         dlg = tk.Toplevel(self.root)
-        dlg.title("必须更新 — ADS122U04")
+        dlg.title("必须更新 — MagSensor")
         dlg.configure(bg=COL_BG)
         dlg.transient(self.root)
         dlg.resizable(False, False)
@@ -2656,6 +3136,8 @@ class App:
             self.record_chk.state(["!disabled"])
             self.dir_entry.configure(state="normal")
             self.dir_btn.state(["!disabled"])
+        for w in (self.formula_entry, self.x_formula_entry, self.x_unit_entry):
+            w.configure(state="disabled" if streaming else "normal")
 
         if st.get("sim"):
             self.conn_var.set("模拟器 · 运行中" if streaming else "模拟器 · 已连接")
@@ -2716,13 +3198,29 @@ class App:
         quick = self.worker.stats.quick()
         self._update_stats(quick)
         streaming = self.worker.get_state().get("streaming", False)
+        shared = None
+        try:
+            if (self.raw_plot is not None and self.formula_plot is not None and
+                    self.raw_plot.index_view is None and
+                    self.formula_plot.index_view is None):
+                rate = self._plot_rate_value()
+                window = self._window_count(quick, rate)
+                shared = self.worker.stats.snapshot(window, max_points=5000)
+        except Exception:
+            shared = None
         if self.plot_paused:
             if self._plot_dirty:
-                self._draw_plot(quick)
+                if self.raw_plot is not None and not self.raw_plot.selecting:
+                    self._draw_raw(quick, shared)
+                if self.formula_plot is not None and not self.formula_plot.selecting:
+                    self._draw_formula(quick, shared)
                 self._plot_dirty = False
             return
         if streaming or self._plot_dirty:
-            self._draw_plot(quick)
+            if self.raw_plot is not None and not self.raw_plot.selecting:
+                self._draw_raw(quick, shared)
+            if self.formula_plot is not None and not self.formula_plot.selecting:
+                self._draw_formula(quick, shared)
             self._plot_dirty = False
 
     def _current_offset(self):
@@ -2746,12 +3244,7 @@ class App:
         return 2.4414e-7
 
     def _display_params(self):
-        """Return (lsb, sign, offset, show_ain0, axis_label, formula, ref_value).
-
-        AIN0 absolute display is only meaningful for the AIN0-AIN1 channel
-        (and the reversed AIN1-AIN0 channel).  Other multiplexer settings fall
-        back to the selected differential voltage.
-        """
+        """Return (lsb, sign, offset, show_ain0, axis_label, formula, ref_value)."""
         lsb = self._current_lsb()
         cfg = self._ui_config()
         try:
@@ -2792,6 +3285,8 @@ class App:
         parts.append(f"丢帧 {q['dropped']}")
         if q["errors"]:
             parts.append(f"错误 {q['errors']}")
+        if q.get("formula_errors"):
+            parts.append(f"公式错误 {q['formula_errors']}")
         if q["resyncs"]:
             parts.append(f"重同步 {q['resyncs']}")
         self.stats_var.set("  ·  ".join(parts))
@@ -2819,34 +3314,53 @@ class App:
             return 1e6, "µV"
         return 1e9, "nV"
 
-    def _draw_plot(self, quick=None):
-        c = self.canvas
-        c.delete("all")
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 120 or h < 100:
-            return
-        if quick is None:
-            quick = self.worker.stats.quick()
+    def _fmt_axis_value(self, value, span):
+        if not math.isfinite(value):
+            return "—"
+        a = abs(value)
+        span = abs(span)
+        if a >= 1e5 or (span and span < 1e-5):
+            return f"{value:.4g}"
+        if span >= 100:
+            return f"{value:.0f}"
+        if span >= 10:
+            return f"{value:.1f}"
+        if span >= 1:
+            return f"{value:.2f}"
+        if span >= 0.01:
+            return f"{value:.4f}"
+        if span >= 1e-4:
+            return f"{value:.6f}"
+        return f"{value:.4g}"
 
-        rate = quick.get("rate") or 0.0
-        if rate <= 0:
-            try:
-                rate = float(self._ui_config().data_rate)
-            except Exception:
-                rate = 1.0
-        tb = self.timebase_var.get()
+    def _window_count(self, quick, rate):
         buffered = quick.get("buffered", 0)
+        tb = self.timebase_var.get()
         if tb == "全部":
-            window = buffered
+            n = buffered
         else:
             try:
                 secs = float(tb.split()[0])
             except Exception:
                 secs = 2.0
-            window = int(rate * secs)
-        window = max(0, min(window, buffered))
+            n = int(rate * secs)
+        return max(0, min(n, buffered))
 
+    def _draw_raw(self, quick, shared=None):
+        self._render_plot(self.raw_plot, quick, shared)
+
+    def _draw_formula(self, quick, shared=None):
+        self._render_plot(self.formula_plot, quick, shared)
+
+    def _render_plot(self, state, quick, shared=None):
+        if state is None:
+            return
+        c = state.canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 120 or h < 100:
+            return
         s = self.ui_scale
         ml, mr = int(66 * s), int(16 * s)
         mt, mb = int(26 * s), int(34 * s)
@@ -2855,125 +3369,200 @@ class App:
             return
         c.create_rectangle(ml, mt, ml + pw, mt + ph, outline=COL_BORDER)
 
-        if window < 2:
-            c.create_text(ml + pw / 2, mt + ph / 2,
-                          text="等待数据…\n连接串口后点击「开始采集」",
-                          fill="#5d6472", font=(FONT, 10), justify="center")
-            return
-
-        snap = self.worker.stats.snapshot(window, max_points=5000)
-        codes = snap["codes"]
-        if len(codes) < 2:
-            c.create_text(ml + pw / 2, mt + ph / 2, text="等待数据…",
-                          fill="#5d6472", font=(FONT, 10))
-            return
-
-        lsb, sign, off, mode_abs, axis_label, formula, ref =             self._display_params()
-        vals = [sign * code * lsb + off for code in codes]
-        vmin, vmax = min(vals), max(vals)
-
-        if self.autoscale_var.get():
-            span = vmax - vmin
-            if span < 30 * lsb:
-                center = (vmax + vmin) / 2
-                vmin, vmax = center - 15 * lsb, center + 15 * lsb
-                span = vmax - vmin
-            pad = span * 0.08 if span > 0 else lsb
-            ymin, ymax = vmin - pad, vmax + pad
+        rate = self._plot_rate_value()
+        if shared is not None and state.index_view is None:
+            snap = shared
+        elif state.index_view is not None:
+            snap = self.worker.stats.snapshot_range(
+                state.index_view[0], state.index_view[1], max_points=5000)
         else:
-            info = self.range_info
-            fs = info.fs if info else 1.0
-            if mode_abs:
-                ymin, ymax = off - fs, off + fs
-            else:
-                ymin, ymax = -fs, fs
+            window = self._window_count(quick, rate)
+            snap = self.worker.stats.snapshot(window, max_points=5000)
+        start_idx = snap.get("start_index", 0)
+        step = snap.get("step", 1) or 1
+        total = snap.get("total", 0)
+        buffered = snap.get("buffered", 0)
+        first_idx = total - buffered
+        last_idx = total - 1
 
-        if ymax - ymin <= 0:
+        if state.kind == "raw":
+            codes = snap.get("codes") or []
+            if not codes:
+                c.create_text(ml + pw / 2, mt + ph / 2,
+                              text="等待数据…\n连接串口后点击「开始采集」",
+                              fill="#5d6472", font=(FONT, 10),
+                              justify="center")
+                state.last = None
+                return
+            lsb, sign, off, mode_abs, axis_label, axis_formula, ref_value = \
+                self._display_params()
+            pts = []
+            for j, code in enumerate(codes):
+                idx = start_idx + j * step
+                pts.append((idx, idx / rate, sign * int(code) * lsb + off))
+            x_unit = "s"
+            x_title = "t (s)"
+            ref_line = True
+            fs = self.range_info.fs if self.range_info else 1.0
+            gain = self._ui_config().gain
+            meta = (f"{snap.get('window', 0)} 样本 · "
+                    f"{quick.get('rate', 0):.1f} SPS · 增益 ×{gain}")
+            trace_color = COL_TRACE
+        else:
+            xs0 = snap.get("xvals") or []
+            ys0 = snap.get("fvals") or []
+            pts = []
+            for j, (xv, yv) in enumerate(zip(xs0, ys0)):
+                try:
+                    xf, yf = float(xv), float(yv)
+                except Exception:
+                    continue
+                if math.isfinite(xf) and math.isfinite(yf):
+                    pts.append((start_idx + j * step, xf, yf))
+            if not pts:
+                c.create_text(ml + pw / 2, mt + ph / 2,
+                              text="等待公式数据…\n开始采集后显示 f(x)",
+                              fill="#5d6472", font=(FONT, 10),
+                              justify="center")
+                state.last = None
+                return
+            x_unit = self.x_unit_var.get().strip() or "X"
+            x_title = f"X ({x_unit})" if x_unit != "X" else "X"
+            ref_line = False
+            ref_value = None
+            fs = None
+            meta = f"f = {self.formula_var.get().strip()[:56]}"
+            trace_color = COL_TRACE2
+
+        xs = [p[1] for p in pts]
+        ys = [p[2] for p in pts]
+        xmin, xmax = min(xs), max(xs)
+        vmin, vmax = min(ys), max(ys)
+        if xmax <= xmin:
+            dx = max(1e-9, abs(xmin) * 1e-6)
+            xmin -= dx
+            xmax += dx
+
+        auto = state.auto_var.get()
+        if auto:
+            if state.kind == "raw":
+                span = vmax - vmin
+                if span < 30 * lsb:
+                    center = (vmax + vmin) / 2
+                    vmin, vmax = center - 15 * lsb, center + 15 * lsb
+                    span = vmax - vmin
+                pad = span * 0.08 if span > 0 else lsb
+                ymin, ymax = vmin - pad, vmax + pad
+            else:
+                span = vmax - vmin
+                if span <= 0:
+                    span = max(abs(vmax) * 0.02, 1e-9)
+                    vmin, vmax = vmax - span / 2, vmax + span / 2
+                pad = span * 0.08
+                ymin, ymax = vmin - pad, vmax + pad
+            state.y_view = None
+        else:
+            if state.y_view is not None:
+                ymin, ymax = state.y_view
+            else:
+                if state.kind == "raw":
+                    ymin, ymax = ((off - fs, off + fs) if mode_abs
+                                  else (-fs, fs))
+                else:
+                    span = vmax - vmin
+                    if span <= 0:
+                        span = max(abs(vmax) * 0.02, 1e-9)
+                    pad = span * 0.08
+                    ymin, ymax = vmin - pad, vmax + pad
+                state.y_view = (ymin, ymax)
+        if ymax <= ymin:
             ymax = ymin + 1e-9
-        scale, unit = self._pick_unit(ymin, ymax)
+
+        if state.kind == "raw":
+            yscale, yunit = self._pick_unit(ymin, ymax)
+            y_title = f"{axis_label} ({yunit})"
+
+            def y_fmt(v):
+                return self._fmt_axis_value(v * yscale,
+                                            (ymax - ymin) * yscale)
+        else:
+            yscale, yunit = 1.0, ""
+            y_title = "f(x)"
+
+            def y_fmt(v):
+                return self._fmt_axis_value(v, ymax - ymin)
+
+        def X(v):
+            return ml + (v - xmin) / (xmax - xmin) * pw
 
         def Y(v):
             return mt + (ymax - v) / (ymax - ymin) * ph
 
-        # grid + y labels
-        step = self._nice_step(ymax - ymin, 5)
-        start = math.ceil(ymin / step) * step
-        v = start
+        # Y grid / labels
+        step_y = self._nice_step(ymax - ymin, 5)
+        start_y = math.ceil(ymin / step_y) * step_y
+        v = start_y
         tick = 0
-        while v <= ymax + step * 0.01 and tick < 20:
+        while v <= ymax + step_y * 0.01 and tick < 20:
             y = Y(v)
             c.create_line(ml, y, ml + pw, y, fill=COL_GRID)
-            sv = v * scale
-            if abs(step * scale) >= 100:
-                txt = f"{sv:.0f}"
-            elif abs(step * scale) >= 10:
-                txt = f"{sv:.1f}"
-            elif abs(step * scale) >= 1:
-                txt = f"{sv:.2f}"
-            elif abs(step * scale) >= 0.1:
-                txt = f"{sv:.3f}"
-            else:
-                txt = f"{sv:.4f}"
-            c.create_text(ml - int(8 * s), y, text=txt, anchor="e",
+            c.create_text(ml - int(8 * s), y, text=y_fmt(v), anchor="e",
                           fill="#6d7585", font=(MONO, 8))
-            v += step
+            v += step_y
             tick += 1
 
-        # x grid / time labels
+        # X grid / labels
         nx = 6
-        t_span = (window - 1) / rate if rate > 0 else 1.0
+        xspan = xmax - xmin
         for i in range(nx + 1):
             x = ml + pw * i / nx
             c.create_line(x, mt, x, mt + ph, fill=COL_GRID)
-            t = -t_span + t_span * i / nx
-            if t_span >= 10:
-                lbl = f"{t:.0f}s"
-            elif t_span >= 1:
-                lbl = f"{t:.1f}s"
-            else:
-                lbl = f"{t:.3f}s"
-            c.create_text(x, mt + ph + int(10 * s), text=lbl, anchor="n",
-                          fill="#6d7585", font=(MONO, 8))
+            xv = xmin + xspan * i / nx
+            c.create_text(x, mt + ph + int(10 * s),
+                          text=self._fmt_axis_value(xv, xspan),
+                          anchor="n", fill="#6d7585", font=(MONO, 8))
 
-        # axis titles
-        c.create_text(ml, mt - int(13 * s),
-                      text=f"{axis_label} ({unit})",
+        c.create_text(ml, mt - int(13 * s), text=y_title,
                       anchor="w", fill="#7d8698", font=(FONT, 8, "bold"))
-        c.create_text(ml + pw, mt - int(13 * s),
-                      text=formula,
+        c.create_text(ml + pw, mt - int(13 * s), text=x_title,
                       anchor="e", fill="#5d6472", font=(FONT, 8))
 
-        # reference line
-        if ymin <= ref <= ymax:
-            y = Y(ref)
+        if ref_line and ref_value is not None and ymin <= ref_value <= ymax:
+            y = Y(ref_value)
             c.create_line(ml, y, ml + pw, y, fill="#59616f", dash=(4, 4))
-            label = (f"AIN1 = {fmt_eng(ref, 5)}" if mode_abs else "0 V")
+            label = (f"AIN1 = {fmt_eng(ref_value, 5)}" if mode_abs else "0 V")
             c.create_text(ml + int(6 * s), y - int(8 * s), text=label,
                           anchor="w", fill="#8891a1", font=(FONT, 7))
 
-        # trace
-        n = len(vals)
-        xs = [ml + pw * i / (n - 1) for i in range(n)]
-        ys = [Y(v) for v in vals]
-        pts = []
-        for x, y in zip(xs, ys):
-            pts.extend((x, y))
-        c.create_line(*pts, fill=COL_TRACE,
-                      width=max(1.0, 1.4 * s), joinstyle="round")
+        n = len(pts)
+        px = [X(p[1]) for p in pts]
+        py = [Y(p[2]) for p in pts]
+        if n >= 2:
+            flat = []
+            for a, b in zip(px, py):
+                flat.extend((a, b))
+            c.create_line(*flat, fill=trace_color,
+                          width=max(1.0, 1.4 * s), joinstyle="round")
+        elif n == 1:
+            r = max(2, int(3 * s))
+            c.create_oval(px[0] - r, py[0] - r, px[0] + r, py[0] + r,
+                          fill=trace_color, outline="")
+        if n:
+            r = max(2, int(3 * s))
+            c.create_oval(px[-1] - r, py[-1] - r,
+                          px[-1] + r, py[-1] + r, fill=COL_WARN, outline="")
 
-        # latest point
-        lx, ly = xs[-1], ys[-1]
-        r = max(2, int(3 * s))
-        c.create_oval(lx - r, ly - r, lx + r, ly + r, fill=COL_WARN, outline="")
-
-        # meta
-        c.create_text(ml + int(6 * s), mt + int(8 * s),
-                      text=f"{window} 样本 · {rate:.1f} SPS · 增益 ×{self._ui_config().gain}",
-                      anchor="nw", fill="#5d6472", font=(MONO, 8))
         if self.plot_paused:
             c.create_text(ml + pw - int(6 * s), mt + int(8 * s),
                           text="显示已暂停", anchor="ne",
                           fill=COL_WARN, font=(FONT, 8, "bold"))
+
+        state.last = {
+            "ml": ml, "mt": mt, "pw": pw, "ph": ph,
+            "xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax,
+            "rate": rate, "first_index": first_idx, "last_index": last_idx,
+            "pts": pts,
+        }
 
     # -- demo --------------------------------------------------------------
     def _demo_connect(self):
@@ -3070,6 +3659,38 @@ def run_selftest():
     check("external ref range", abs(r2.vref - 1.0) < 1e-12 and r2.valid)
     check("bypass abs window", abs(r2.abs_lo - (-0.1)) < 1e-12 and
           abs(r2.abs_hi - 3.4) < 1e-12)
+
+    # Formula evaluator (C expression subset)
+    fvars = dict(FORMULA_VARIABLE_TYPES)
+    fctx = {"ain0": 1.7, "ain1": 1.65}
+    fcases = [
+        ("1+2*3", {}, 7),
+        ("1/2", {}, 0),
+        ("1.0/2", {}, 0.5),
+        ("-5%2", {}, -1),
+        ("0x10 + 010", {}, 24),
+        ("1e3", {}, 1000.0),
+        ("2?10:20", {}, 10),
+        ("1&&0||1", {}, 1),
+        ("(int)3.9", {}, 3),
+        ("(double)1/2", {}, 0.5),
+        ("sqrt(9)", {}, 3.0),
+        ("round(2.5)", {}, 3.0),
+        ("round(-2.5)", {}, -3.0),
+        ("M_PI > 3", {}, 1),
+        ("ain0 - ain1", fctx, 0.05),
+    ]
+    for expr, cctx, exp in fcases:
+        try:
+            val = formula_engine.compile_expr(expr, fvars).eval(cctx)
+            check(f"formula {expr}", abs(float(val) - exp) < 1e-9, f"{val!r}")
+        except Exception as exc:
+            check(f"formula {expr}", False, str(exc))
+    try:
+        formula_engine.compile_expr("1+", fvars)
+        check("formula invalid rejected", False)
+    except Exception:
+        check("formula invalid rejected", True)
 
     print("\nRESULT:", "ALL PASS" if ok else "FAILURES PRESENT")
     return 0 if ok else 1

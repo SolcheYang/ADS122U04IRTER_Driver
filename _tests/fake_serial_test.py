@@ -233,6 +233,7 @@ def run_case(name, cfg, record=True, run_secs=1.2, folder=None, sample_meta=None
         print("raw bytes:", len(raw), "csv rows:", len(rows) - 1,
               "frame len:", cfg.frame_len,
               "partial tail:", len(raw) % cfg.frame_len)
+        assert rows and rows[0][7:] == ["x_value", "formula_value"], rows[0]
         # A stop can leave a partial frame in the raw stream; complete frames
         # must still match the decoded CSV row count.
         # Re-decode the saved raw stream independently.
@@ -257,6 +258,10 @@ def run_case(name, cfg, record=True, run_secs=1.2, folder=None, sample_meta=None
             assert abs(float(rows[1][1]) - 0.0) < 1e-9
             if len(rows) > 2:
                 assert abs(float(rows[2][1]) - 1.0 / cfg.data_rate) < 1e-6
+            # default formulas: x = t, f = ain0
+            assert rows[1][7] and rows[1][8]
+            assert abs(float(rows[1][7]) - float(rows[1][1])) < 1e-5
+            assert abs(float(rows[1][8]) - float(rows[1][6])) < 1e-6
         print("files OK")
     w.shutdown()
     print("PASS", name)
