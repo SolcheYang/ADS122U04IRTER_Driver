@@ -8,8 +8,8 @@ Features
   * full register configuration through a GUI + one-click apply / readback verify
   * automatic data read mode (AUTO=1), robust frame parsing (counter / inverted /
     CRC-16), raw byte stream + decoded CSV recording
-  * real-time waveform, measurement range calculator for AIN0-AIN1 with AIN1 as
-    the signal bias voltage
+  * real-time waveform for the selected input channel, measurement range
+    calculator with a configurable input bias voltage
   * built-in hardware-free simulator
 
 Register / protocol reference: TI ADS122U04 datasheet SBAS752B.
@@ -96,6 +96,20 @@ MUX_CHOICES = [
     (14, "输入短接至 (AVDD+AVSS)/2"),
 ]
 
+# (positive, negative) analog input pin selected by each MUX code.
+MUX_PINS = {
+    0: ("AIN0", "AIN1"), 1: ("AIN0", "AIN2"), 2: ("AIN0", "AIN3"),
+    3: ("AIN1", "AIN0"), 4: ("AIN1", "AIN2"), 5: ("AIN1", "AIN3"),
+    6: ("AIN2", "AIN3"), 7: ("AIN3", "AIN2"),
+    8: ("AIN0", "AVSS"), 9: ("AIN1", "AVSS"), 10: ("AIN2", "AVSS"),
+    11: ("AIN3", "AVSS"),
+}
+
+
+def is_differential_mux(mux: int) -> bool:
+    """True for the eight differential pairs (MUX 0..7)."""
+    return 0 <= mux <= 7
+
 GAIN_CHOICES = [(1, "× 1"), (2, "× 2"), (4, "× 4"), (8, "× 8"),
                 (16, "× 16"), (32, "× 32"), (64, "× 64"), (128, "× 128")]
 GAIN_CODES = {g: i for i, g in enumerate([1, 2, 4, 8, 16, 32, 64, 128])}
@@ -112,7 +126,7 @@ DR_TABLE = {
 
 FORMULA_VARIABLE_TYPES = {
     "i": "int", "t": "float", "code": "int", "vin": "float",
-    "ain0": "float", "rate": "float", "lsb": "float",
+    "ain": "float", "ain0": "float", "rate": "float", "lsb": "float",
     "vref": "float", "gain": "int", "fs": "float",
     "ain1": "float", "avdd": "float", "refp": "float",
 }
@@ -520,7 +534,7 @@ class RangeInfo:
     message: str = ""
 
 
-def compute_range(cfg: DeviceConfig, refp: float, ain1: float, avdd: float,
+def compute_range(cfg: DeviceConfig, refp: float, bias: float, avdd: float,
                   avss: float = 0.0) -> RangeInfo:
     gain, bypass = cfg.effective()
     if cfg.vref_code == 0:
@@ -541,7 +555,7 @@ def compute_range(cfg: DeviceConfig, refp: float, ain1: float, avdd: float,
         info.valid = False
         info.message = "当前为监测/短接模式，量程计算不适用"
         info.abs_lo, info.abs_hi = avss, avdd
-        info.usable_lo = info.usable_hi = ain1
+        info.usable_lo = info.usable_hi = bias
         return info
 
     if bypass:
@@ -555,12 +569,15 @@ def compute_range(cfg: DeviceConfig, refp: float, ain1: float, avdd: float,
         info.abs_lo = avss + 0.2 + k * info.fs
         info.abs_hi = avdd - 0.2 - k * info.fs
 
-    info.usable_lo = max(ain1 - info.fs, info.abs_lo)
-    info.usable_hi = min(ain1 + info.fs, info.abs_hi)
-    info.bias_ok = info.abs_lo <= ain1 <= info.abs_hi
+    info.usable_lo = max(bias - info.fs, info.abs_lo)
+    info.usable_hi = min(bias + info.fs, info.abs_hi)
+    if cfg.mux in (8, 9, 10, 11):
+        # Single-ended: AINN = AVSS, the input cannot swing below ground.
+        info.usable_lo = max(info.usable_lo, avss)
+    info.bias_ok = info.abs_lo <= bias <= info.abs_hi
     if not info.bias_ok:
         info.valid = False
-        info.message = (f"AIN1 偏置 {ain1:.4f} V 超出 PGA 绝对输入窗口 "
+        info.message = (f"输入偏置 {bias:.4f} V 超出 PGA 绝对输入窗口 "
                         f"{info.abs_lo:.3f} ~ {info.abs_hi:.3f} V")
     elif info.usable_lo >= info.usable_hi:
         info.valid = False
@@ -1036,7 +1053,7 @@ class SerialWorker(threading.Thread):
         self._lsb = float(meta.get("lsb", 2.4414e-7)) or 2.4414e-7
         self._ain1 = float(meta.get("ain1", 0.0))
         self._mux = cfg.mux
-        self._formula_text = (meta.get("formula") or "ain0").strip()
+        self._formula_text = (meta.get("formula") or "ain").strip()
         self._x_formula_text = (meta.get("x_formula") or "t").strip()
         self._x_unit = (meta.get("x_unit") or "s").strip() or "s"
         self._formula_rate = float(cfg.data_rate) or 1.0
@@ -1257,12 +1274,11 @@ class SerialWorker(threading.Thread):
     def _on_sample(self, code, counter):
         host_t = time.monotonic() - self._acq_t0
         vin = code * self._lsb
-        if self._mux == 0:
-            ain0 = vin + self._ain1       # AIN0 = (AIN0 - AIN1) + AIN1
-        elif self._mux == 3:
-            ain0 = self._ain1 - vin       # reversed channel AIN1 - AIN0
+        if 0 <= self._mux <= 11:
+            # AINP (the positive input) absolute voltage = VIN + AINN bias.
+            ain0 = vin + self._ain1
         else:
-            ain0 = None                   # AIN0 absolute is not derivable
+            ain0 = None                   # monitor modes: no AIN pin involved
         idx = self._sample_index
         ain0_val = ain0 if ain0 is not None else float("nan")
         ctx = self._formula_ctx
@@ -1270,7 +1286,8 @@ class SerialWorker(threading.Thread):
         ctx["t"] = idx / self._formula_rate if self._formula_rate else 0.0
         ctx["code"] = code
         ctx["vin"] = vin
-        ctx["ain0"] = ain0_val
+        ctx["ain"] = ain0_val
+        ctx["ain0"] = ain0_val   # legacy alias
         fval = float("nan")
         xval = float("nan")
         try:
@@ -1419,7 +1436,7 @@ class App:
         self._last_valid = None
         self.raw_plot = None
         self.formula_plot = None
-        self.formula_var = tk.StringVar(value="ain0")
+        self.formula_var = tk.StringVar(value="ain")
         self.x_formula_var = tk.StringVar(value="t")
         self.x_unit_var = tk.StringVar(value="s")
         self.formula_autoscale_var = tk.BooleanVar(value=True)
@@ -1532,7 +1549,7 @@ class App:
             self.autoscale_var.set(bool(s.get("autoscale", True)))
             mode = s.get("plot_mode", "abs")
             self.plot_mode_var.set(mode if mode in ("abs", "diff") else "abs")
-            self.formula_var.set(str(s.get("formula", "ain0")))
+            self.formula_var.set(str(s.get("formula", "ain")))
             self.x_formula_var.set(str(s.get("x_formula", "t")))
             self.x_unit_var.set(str(s.get("x_unit", "s")))
             self.formula_autoscale_var.set(bool(s.get("formula_autoscale", True)))
@@ -1642,17 +1659,17 @@ class App:
         s = self.ui_scale
         wl, wt, wr, wb = get_work_area()
         ww, wh = max(800, wr - wl), max(600, wb - wt)
-        # Design size 1340x900 at 96 dpi, scaled to the actual DPI.
+        # Design size 1500x900 at 96 dpi, scaled to the actual DPI.
         # Reserve space for the title bar / frame, otherwise the window can
         # extend below the taskbar on high-DPI displays.
-        w = min(int(1340 * s), ww - int(30 * s))
-        h = min(int(900 * s), wh - int(80 * s))
-        w = max(w, min(int(1120 * s), ww - int(30 * s)))
-        h = max(h, min(int(740 * s), wh - int(80 * s)))
+        w = min(int(1500 * s), ww - int(30 * s))
+        h = min(int(900 * s), wh - int(48 * s))
+        w = max(w, min(int(1320 * s), ww - int(30 * s)))
+        h = max(h, min(int(740 * s), wh - int(48 * s)))
         x = wl + max(0, (ww - w) // 2)
         y = wt + max(0, (wh - h) // 2 - int(35 * s))
         root.geometry(f"{w}x{h}+{x}+{y}")
-        root.minsize(min(int(1120 * s), ww - 20),
+        root.minsize(min(int(1320 * s), ww - 20),
                      min(int(680 * s), wh - 20))
 
         self._build_header()
@@ -1673,8 +1690,14 @@ class App:
         self._bind_wheel_tree(self.side)
 
         right = tk.Frame(content, bg=COL_BG)
-        right.grid(row=0, column=1, sticky="nsew", padx=(int(6 * s), 0))
+        right.grid(row=0, column=1, sticky="nsew",
+                   padx=(int(6 * s), int(6 * s)))
         self._build_right(right)
+
+        rail = tk.Frame(content, bg=COL_BG, width=int(320 * s))
+        rail.grid(row=0, column=2, sticky="ns")
+        rail.pack_propagate(False)
+        self._build_range_panel(rail)
 
         self._log_colors()
         self._log("info", f"{APP_NAME} v{APP_VERSION} 已启动")
@@ -1781,6 +1804,31 @@ class App:
                                        values=[x[1] for x in VREF_CHOICES],
                                        state="readonly")
         self._form_row(cfg, row, "参考源", self.vref_combo); row += 1
+
+        # ---- analog parameters (used by the measurement-range panel) ----
+        tk.Label(cfg, text="模拟参数", bg=COL_PANEL, fg=COL_ACCENT,
+                 font=(FONT, 8, "bold")).grid(row=row, column=0, columnspan=2,
+                                              sticky="w", pady=(7, 0))
+        row += 1
+
+        self.refp_var = tk.StringVar(value="2.048")
+        self.refp_entry = ttk.Entry(cfg, textvariable=self.refp_var, width=11)
+        self._form_row(cfg, row, "REFP 参考 (V)", self.refp_entry); row += 1
+
+        self.ain1_var = tk.StringVar(value="1.65")
+        self.bias_entry = ttk.Entry(cfg, textvariable=self.ain1_var, width=11)
+        self._form_row(cfg, row, "输入偏置 (V)", self.bias_entry); row += 1
+
+        self.bias_hint_var = tk.StringVar(value="")
+        tk.Label(cfg, textvariable=self.bias_hint_var, bg=COL_PANEL,
+                 fg="#5d6472", font=(FONT, 7), justify="left", anchor="w",
+                 wraplength=int(370 * s)).grid(row=row, column=0, columnspan=2,
+                                               sticky="w", pady=(0, 1))
+        row += 1
+
+        self.avdd_var = tk.StringVar(value="3.3")
+        self.avdd_entry = ttk.Entry(cfg, textvariable=self.avdd_var, width=11)
+        self._form_row(cfg, row, "AVDD 电源 (V)", self.avdd_entry); row += 1
 
         self.bypass_var = tk.BooleanVar(value=False)
         self.bypass_chk = ttk.Checkbutton(cfg, text="PGA 旁路（仅增益 ≤4）",
@@ -1908,74 +1956,75 @@ class App:
         except Exception:
             pass
 
-    def _build_right(self, parent):
+    def _build_range_panel(self, parent):
+        """Right-hand column: live measurement-range readout."""
         s = self.ui_scale
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
-        # ---- range calculator ----
+        wrap = int(258 * s)
         self.calc_lf = ttk.Labelframe(
-            parent, text=" 测量范围计算 · AIN0 − AIN1（AIN1 = 信号偏置） ",
-            style="Panel.TLabelframe")
-        self.calc_lf.grid(row=0, column=0, sticky="ew")
+            parent, text=" 测量范围 ", style="Panel.TLabelframe")
+        self.calc_lf.pack(fill="both", expand=True)
         body = tk.Frame(self.calc_lf, bg=COL_PANEL)
-        body.pack(fill="x", padx=12, pady=(8, 10))
+        body.pack(fill="both", expand=True, padx=10, pady=(8, 10))
 
-        inputs = tk.Frame(body, bg=COL_PANEL)
-        inputs.pack(fill="x")
-        self.refp_var = tk.StringVar(value="2.048")
-        self.ain1_var = tk.StringVar(value="1.65")
-        self.avdd_var = tk.StringVar(value="3.3")
-        for col, (text, var, tip) in enumerate([
-            ("REFP 参考电压 (V)", self.refp_var, "外部参考时生效"),
-            ("AIN1 偏置电压 (V)", self.ain1_var, "信号输入端 AIN0 的偏置"),
-            ("AVDD 模拟电源 (V)", self.avdd_var, "AVSS 视为 0 V"),
-        ]):
-            f = tk.Frame(inputs, bg=COL_PANEL)
-            f.grid(row=0, column=col, sticky="w", padx=(0, 18))
-            tk.Label(f, text=text, bg=COL_PANEL, fg=COL_MUTED,
-                     font=(FONT, 8)).pack(anchor="w")
-            e = ttk.Entry(f, textvariable=var, width=13)
-            e.pack(anchor="w", pady=(2, 0))
-            tk.Label(f, text=tip, bg=COL_PANEL, fg="#5d6472",
-                     font=(FONT, 7)).pack(anchor="w", pady=(1, 0))
+        self.range_channel_var = tk.StringVar(value="")
+        self.range_channel_lbl = tk.Label(
+            body, textvariable=self.range_channel_var, bg=COL_PANEL,
+            fg=COL_ACCENT, font=(FONT, 9, "bold"), anchor="w", justify="left",
+            wraplength=wrap)
+        self.range_channel_lbl.pack(fill="x", pady=(0, 6))
+
+        self.range_line1 = tk.StringVar(value="")
+        self.range_line_fs = tk.StringVar(value="")
+        self.range_line2 = tk.StringVar(value="")
+        self.range_line3 = tk.StringVar(value="")
+
+        tk.Label(body, textvariable=self.range_line1, bg=COL_PANEL, fg=COL_FG,
+                 font=(MONO, 9), anchor="w", justify="left",
+                 wraplength=wrap).pack(fill="x")
+        tk.Label(body, textvariable=self.range_line_fs, bg=COL_PANEL,
+                 fg=COL_FG, font=(MONO, 9), anchor="w", justify="left",
+                 wraplength=wrap).pack(fill="x", pady=(2, 0))
+
+        self.range_lbl2 = tk.Label(body, textvariable=self.range_line2,
+                                   bg=COL_PANEL, fg=COL_GREEN,
+                                   font=(FONT, 9, "bold"), anchor="w",
+                                   justify="left", wraplength=wrap)
+        self.range_lbl2.pack(fill="x", pady=(10, 0))
+
+        self.range_bar = tk.Canvas(body, height=int(74 * s), width=1,
+                                   bg="#1a1c23", highlightthickness=0, bd=0)
+        self.range_bar.pack(fill="x", pady=(8, 8))
+        self.range_bar.bind("<Configure>", lambda e: self._draw_range_bar())
+
+        tk.Label(body, textvariable=self.range_line3, bg=COL_PANEL,
+                 fg=COL_MUTED, font=(FONT, 8), anchor="w", justify="left",
+                 wraplength=wrap).pack(fill="x")
 
         for var in (self.refp_var, self.ain1_var, self.avdd_var):
             var.trace_add("write", lambda *a: self._update_range())
 
-        self.range_line1 = tk.StringVar(value="")
-        self.range_line2 = tk.StringVar(value="")
-        self.range_line3 = tk.StringVar(value="")
-        tk.Label(body, textvariable=self.range_line1, bg=COL_PANEL, fg=COL_FG,
-                 font=(MONO, 9), anchor="w", justify="left",
-                 wraplength=int(830 * s)).pack(fill="x", pady=(8, 3))
-        self.range_lbl2 = tk.Label(body, textvariable=self.range_line2,
-                                   bg=COL_PANEL, fg=COL_GREEN,
-                                   font=(FONT, 9, "bold"), anchor="w",
-                                   justify="left", wraplength=int(830 * s))
-        self.range_lbl2.pack(fill="x")
-        tk.Label(body, textvariable=self.range_line3, bg=COL_PANEL,
-                 fg=COL_MUTED, font=(FONT, 8), anchor="w", justify="left",
-                 wraplength=int(830 * s)).pack(fill="x", pady=(2, 0))
-
-        self.range_bar = tk.Canvas(body, height=int(58 * s), bg="#1a1c23",
-                                   highlightthickness=0, bd=0)
-        self.range_bar.pack(fill="x", pady=(6, 0))
-        self.range_bar.bind("<Configure>", lambda e: self._draw_range_bar())
-
+    def _build_right(self, parent):
+        s = self.ui_scale
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
+        # Let the centre column shrink so the right rail is never pushed out
+        # when the window is resized; oversized children are simply clipped.
+        parent.grid_propagate(False)
         # ---- raw waveform ----
         self.plots_pane = tk.PanedWindow(
             parent, orient=tk.VERTICAL, bg=COL_BG,
             sashwidth=max(4, int(6 * s)), sashpad=0, bd=0, relief="flat")
-        self.plots_pane.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        self.plots_pane.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         self.plot_lf = ttk.Labelframe(self.plots_pane, text=" 实时波形 · 原始 ",
                                       style="Panel.TLabelframe")
 
         tb = tk.Frame(self.plot_lf, bg=COL_PANEL)
         tb.pack(fill="x", padx=10, pady=(6, 2))
         self.plot_mode_var = tk.StringVar(value="abs")
-        ttk.Radiobutton(tb, text="AIN0 绝对电压", value="abs",
-                        variable=self.plot_mode_var,
-                        command=self._on_raw_mode_changed).pack(side="left")
+        self.abs_radio = ttk.Radiobutton(
+            tb, text="绝对电压", value="abs", variable=self.plot_mode_var,
+            command=self._on_raw_mode_changed)
+        self.abs_radio.pack(side="left")
         ttk.Radiobutton(tb, text="差分 VIN", value="diff",
                         variable=self.plot_mode_var,
                         command=self._on_raw_mode_changed).pack(side="left", padx=(8, 0))
@@ -2060,7 +2109,7 @@ class App:
             fg=COL_MUTED, font=(FONT, 8), anchor="w", justify="left",
             wraplength=int(850 * s))
         self.formula_status_lbl.pack(fill="x", padx=2, pady=(2, 0))
-        tk.Label(ftb, text=("变量: i, t, code, vin, ain0, rate, lsb, vref, gain, "
+        tk.Label(ftb, text=("变量: i, t, code, vin, ain, rate, lsb, vref, gain, "
                             "fs, ain1, avdd, refp · 函数: sqrt/sin/cos/pow/..."
                             " · 支持 C 整数/浮点、位运算、条件表达式"),
                  bg=COL_PANEL, fg="#5d6472", font=(FONT, 7), anchor="w",
@@ -2098,7 +2147,7 @@ class App:
         # ---- log ----
         self.log_lf = ttk.Labelframe(parent, text=" 事件日志 ",
                                      style="Panel.TLabelframe")
-        self.log_lf.grid(row=2, column=0, sticky="ew")
+        self.log_lf.grid(row=1, column=0, sticky="ew")
         logbody = tk.Frame(self.log_lf, bg=COL_PANEL)
         logbody.pack(fill="both", expand=True, padx=8, pady=(5, 7))
         self.log_text = tk.Text(logbody, height=3, bg="#14161b", fg="#c7ccd6",
@@ -2496,56 +2545,102 @@ class App:
         self.frame_hint_var.set(
             "数据帧：" + cfg.frame_description() +
             f" · 需 ≥ {need_bps / 1000:.1f} kbit/s{warn}")
+        self._sync_input_ui(cfg)
         self._update_range()
+
+    def _sync_input_ui(self, cfg=None):
+        """Bias entry / absolute-voltage view follow the selected input channel."""
+        cfg = cfg or self._ui_config()
+        differential = is_differential_mux(cfg.mux)
+        if differential:
+            self.bias_entry.state(["!disabled"])
+            self.bias_hint_var.set("差分输入：填入参考端（AINN）的直流电压。")
+        else:
+            self.bias_entry.state(["disabled"])
+            if cfg.mux < 12:
+                self.bias_hint_var.set("单端输入：AINN = AVSS，输入偏置固定为 0 V。")
+            else:
+                self.bias_hint_var.set("监测 / 短接模式不使用输入偏置。")
+        pin = MUX_PINS.get(cfg.mux, (None, None))[0]
+        if pin is not None:
+            self.abs_radio.configure(text=f"{pin} 绝对电压")
+            self.abs_radio.state(["!disabled"])
+        else:
+            self.abs_radio.configure(text="绝对电压")
+            self.abs_radio.state(["disabled"])
+            if self.plot_mode_var.get() == "abs":
+                self.plot_mode_var.set("diff")
+                self._on_raw_mode_changed()
+        self._plot_dirty = True
 
     def _range_values(self):
         refp = float(self.refp_var.get().strip())
-        ain1 = float(self.ain1_var.get().strip())
+        bias = float(self.ain1_var.get().strip())
         avdd = float(self.avdd_var.get().strip())
-        if not all(math.isfinite(v) for v in (refp, ain1, avdd)):
+        if not all(math.isfinite(v) for v in (refp, bias, avdd)):
             raise ValueError("输入必须是有限数值")
         if not (refp > 0 and avdd > 0):
             raise ValueError("REFP / AVDD 必须大于 0")
-        return refp, ain1, avdd
+        return refp, bias, avdd
+
+    def _effective_bias(self, cfg, bias: float) -> float:
+        """Single-ended and monitor modes reference AVSS (0 V)."""
+        return float(bias) if is_differential_mux(cfg.mux) else 0.0
 
     def _update_range(self):
         cfg = self._ui_config()
+        differential = is_differential_mux(cfg.mux)
+        pos, neg = MUX_PINS.get(cfg.mux, (None, None))
+        if pos is None:
+            channel = "内部监测"
+        else:
+            channel = f"{pos} − {neg} · {'差分' if differential else '单端'}"
+        self.range_channel_var.set(channel)
         try:
-            refp, ain1, avdd = self._range_values()
+            refp, bias_raw, avdd = self._range_values()
         except Exception:
-            self.range_line1.set("请输入有效的 REFP / AIN1 / AVDD（单位 V）")
+            self.range_line1.set("请输入有效的 REFP / 输入偏置 / AVDD（单位 V）")
+            self.range_line_fs.set("")
             self.range_line2.set("输入无效")
             self.range_lbl2.configure(fg=COL_ERR)
             self.range_line3.set("")
             self.range_info = None
             self._draw_range_bar()
             return
-        info = compute_range(cfg, refp, ain1, avdd)
+        bias = self._effective_bias(cfg, bias_raw)
+        info = compute_range(cfg, refp, bias, avdd)
         self.range_info = info
-        self._last_valid = (cfg, refp, ain1, avdd, info)
-        self.range_line1.set(
-            f"VREF {info.vref:.5g} V   ·   增益 ×{info.gain}   ·   "
-            f"满量程 ±{fmt_eng(info.fs)}   ·   1 LSB = {fmt_eng(info.lsb)}   ·   "
-            f"{'PGA 旁路' if info.bypass else 'PGA 使能'}")
+        self._last_valid = (cfg, refp, bias, avdd, info)
+        self.range_line1.set(f"VREF {info.vref:.5g} V · 增益 ×{info.gain}")
+        self.range_line_fs.set(
+            f"{'PGA 旁路' if info.bypass else 'PGA 使能'} · "
+            f"满量程 ±{fmt_eng(info.fs)}\n1 LSB = {fmt_eng(info.lsb)}")
         if info.valid:
-            down = ain1 - info.usable_lo
-            up = info.usable_hi - ain1
+            down = bias - info.usable_lo
+            up = info.usable_hi - bias
+            if differential:
+                detail = (f"（相对输入偏置 −{fmt_eng(down)} / "
+                          f"+{fmt_eng(up)}）")
+            else:
+                detail = "（单端输入，参考端 AVSS）"
             self.range_line2.set(
-                f"AIN0 可用范围  {info.usable_lo:.4f} V ~ {info.usable_hi:.4f} V"
-                f"      （相对 AIN1 偏置：−{fmt_eng(down)} / +{fmt_eng(up)}）")
+                f"AIN 可用范围\n{info.usable_lo:.4f} V ~ {info.usable_hi:.4f} V\n"
+                + detail)
             self.range_lbl2.configure(fg=COL_GREEN)
         else:
             self.range_line2.set("范围不可用：" + info.message)
             self.range_lbl2.configure(fg=COL_ERR)
-        note = ""
-        if cfg.mux == 3:
-            note = ("当前通道为 AIN1−AIN0（反向），波形按 AIN0 = AIN1 − VIN 显示。 ")
-        elif cfg.mux != 0:
-            note = (f"当前通道为 {label_for(MUX_CHOICES, cfg.mux)}，"
-                    "量程按 AIN0−AIN1 估算；波形电压换算仅供参考。 ")
-        self.range_line3.set(
-            note + f"PGA 绝对输入窗口 {info.abs_lo:.3f} V ~ {info.abs_hi:.3f} V"
-            f"（AIN0 与 AIN1 均需在此窗口内）；LSB = 2·VREF/(增益·2^24)。")
+        if cfg.mux >= 12:
+            self.range_line3.set("监测 / 短接模式，量程计算不适用。")
+        else:
+            if differential:
+                note = "差分输入：绝对电压 = VIN + 输入偏置。"
+            else:
+                note = "单端输入：参考端为 AVSS，输入偏置固定 0 V。"
+            self.range_line3.set(
+                note + f"\nPGA 绝对输入窗口 {info.abs_lo:.3f} V ~ "
+                f"{info.abs_hi:.3f} V（AIN 输入需在此窗口内）；"
+                f"LSB = 2·VREF/(增益·2^24)。")
         self._draw_range_bar()
         self._plot_dirty = True
 
@@ -2558,8 +2653,9 @@ class App:
         if w < 60 or h < 20:
             return
         info = self.range_info
+        cfg = self._ui_config()
         try:
-            _, ain1, avdd = self._range_values()
+            _, bias_raw, avdd = self._range_values()
         except Exception:
             c.create_text(w // 2, h // 2, text="等待有效输入…", fill=COL_MUTED,
                           font=(FONT, 8))
@@ -2568,17 +2664,23 @@ class App:
             c.create_text(w // 2, h // 2, text="等待有效配置…", fill=COL_MUTED,
                           font=(FONT, 8))
             return
+        if cfg.mux >= 12:
+            c.create_text(w // 2, h // 2, text="监测 / 短接模式 · 量程不适用",
+                          fill=COL_MUTED, font=(FONT, 8))
+            return
+        differential = is_differential_mux(cfg.mux)
+        bias = self._effective_bias(cfg, bias_raw)
 
         s = self.ui_scale
         pad = int(12 * s)
-        axis_lo = min(0.0, info.abs_lo, info.usable_lo, ain1) - 0.03 * max(avdd, 0.1)
-        axis_hi = max(avdd, info.abs_hi, info.usable_hi, ain1) + 0.03 * max(avdd, 0.1)
+        axis_lo = min(0.0, info.abs_lo, info.usable_lo, bias) - 0.03 * max(avdd, 0.1)
+        axis_hi = max(avdd, info.abs_hi, info.usable_hi, bias) + 0.03 * max(avdd, 0.1)
         span = max(1e-9, axis_hi - axis_lo)
 
         def X(v):
             return pad + (v - axis_lo) / span * (w - 2 * pad)
 
-        y0, y1 = int(8 * s), h - int(12 * s)
+        y0, y1 = int(16 * s), h - int(12 * s)
         c.create_rectangle(pad, y0, w - pad, y1, outline="", fill="#20232b")
         # absolute window
         lo, hi = X(info.abs_lo), X(info.abs_hi)
@@ -2591,18 +2693,22 @@ class App:
             c.create_rectangle(lo, y0 + int(20 * s), hi, y0 + int(29 * s),
                                outline="", fill=color)
             c.create_text((lo + hi) / 2, y0 + int(32.5 * s),
-                          text="AIN0 可用", anchor="n",
+                          text="AIN 可用", anchor="n",
                           fill="#8fe3c4" if info.valid else "#f3a3a3",
                           font=(FONT, 7))
 
-        # AIN1 marker
-        x = X(ain1)
-        c.create_line(x, int(3 * s), x, y1 - 1, fill=COL_WARN, dash=(3, 2))
-        c.create_polygon(x - int(5 * s), int(2 * s), x + int(5 * s),
-                         int(2 * s), x, int(9 * s), fill=COL_WARN, outline="")
-        c.create_text(x, y0 + int(2 * s), text="AIN1", anchor="s",
-                      fill=COL_WARN, font=(FONT, 7, "bold"))
-        c.create_text(pad, h - int(2 * s), text="0 V", anchor="sw",
+        if differential:
+            # input-bias marker
+            x = X(bias)
+            c.create_line(x, int(6 * s), x, y1 - 1, fill=COL_WARN, dash=(3, 2))
+            c.create_polygon(x - int(5 * s), int(2 * s), x + int(5 * s),
+                             int(2 * s), x, int(9 * s), fill=COL_WARN, outline="")
+            to_right = x < w / 2
+            c.create_text(x + int(7 * s) if to_right else x - int(7 * s),
+                          int(1 * s), text="输入偏置",
+                          anchor="nw" if to_right else "ne",
+                          fill=COL_WARN, font=(FONT, 7, "bold"))
+        c.create_text(X(0.0), h - int(2 * s), text="0 V", anchor="sw",
                       fill="#5d6472", font=(FONT, 7))
         c.create_text(w - pad, h - int(2 * s), text=f"{avdd:.2f} V",
                       anchor="se", fill="#5d6472", font=(FONT, 7))
@@ -2649,8 +2755,9 @@ class App:
             return
         try:
             cfg = self._ui_config()
-            refp, ain1, avdd = self._range_values()
-            info = compute_range(cfg, refp, ain1, avdd)
+            refp, bias_raw, avdd = self._range_values()
+            bias = self._effective_bias(cfg, bias_raw)
+            info = compute_range(cfg, refp, bias, avdd)
             if refp <= 0:
                 raise ValueError("REFP 必须大于 0")
         except Exception as exc:
@@ -2690,7 +2797,7 @@ class App:
             "tool": APP_NAME, "version": APP_VERSION,
             "created": datetime.now().isoformat(timespec="seconds"),
             "port": st.get("port", ""), "baud": st.get("baud", 0),
-            "lsb": info.lsb, "ain1": ain1,
+            "lsb": info.lsb, "ain1": bias,
             "vref": info.vref, "gain": info.gain, "fs": info.fs,
             "avdd": avdd, "refp": refp,
             "device_config": {
@@ -2708,20 +2815,21 @@ class App:
             "x_unit": self.x_unit_var.get().strip() or "s",
             "formula_context": {
                 "rate": cfg.data_rate, "lsb": info.lsb, "vref": info.vref,
-                "gain": info.gain, "fs": info.fs, "ain1": ain1,
+                "gain": info.gain, "fs": info.fs, "ain1": bias,
                 "avdd": avdd, "refp": refp,
             },
             "range": {
-                "refp_V": refp, "ain1_V": ain1, "avdd_V": avdd,
+                "refp_V": refp, "bias_V": bias, "ain1_V": bias, "avdd_V": avdd,
                 "vref_V": info.vref, "gain": info.gain,
                 "full_scale_V": info.fs, "lsb_V": info.lsb,
                 "abs_input_V": [info.abs_lo, info.abs_hi],
+                "usable_ain_V": [info.usable_lo, info.usable_hi],
                 "usable_ain0_V": [info.usable_lo, info.usable_hi],
                 "valid": info.valid, "message": info.message,
             },
-            "note": ("CSV 中的 vin = 原始码 × LSB；AIN0−AIN1 通道下 "
-                     "ain0 = vin + AIN1；反向通道 AIN1−AIN0 下 ain0 = AIN1 − vin；"
-                     "其他通道 ain0 留空。"),
+            "note": ("CSV 中的 vin = 原始码 × LSB；ain0 为正输入引脚（AINP）"
+                     "绝对电压 = vin + 输入偏置；单端输入偏置为 0，"
+                     "监测模式下 ain0 留空。"),
         }
         self.worker.start_acq(cfg, record, folder, meta)
         self._log("info", f"开始采集请求 · 记录={'开启' if record else '关闭'}")
@@ -3227,7 +3335,8 @@ class App:
         mode = self.plot_mode_var.get()
         if mode == "abs":
             try:
-                return float(self.ain1_var.get())
+                return self._effective_bias(self._ui_config(),
+                                            float(self.ain1_var.get()))
             except Exception:
                 return 0.0
         return 0.0
@@ -3244,21 +3353,22 @@ class App:
         return 2.4414e-7
 
     def _display_params(self):
-        """Return (lsb, sign, offset, show_ain0, axis_label, formula, ref_value)."""
+        """Return (lsb, sign, offset, show_abs, axis_label, formula, ref_value).
+
+        In absolute mode the plotted value is the voltage on the positive input
+        pin (AINP) of the selected channel: AINP = VIN + input bias.
+        """
         lsb = self._current_lsb()
         cfg = self._ui_config()
         try:
-            ain1 = float(self.ain1_var.get())
+            bias = self._effective_bias(cfg, float(self.ain1_var.get()))
         except Exception:
-            ain1 = 0.0
+            bias = 0.0
         want_abs = self.plot_mode_var.get() == "abs"
-        if want_abs and cfg.mux == 0:
-            return lsb, 1.0, ain1, True, "AIN0", "AIN0 = VIN + AIN1", ain1
-        if want_abs and cfg.mux == 3:
-            return lsb, -1.0, ain1, True, "AIN0", "AIN0 = AIN1 − VIN", ain1
-        if want_abs:
-            return (lsb, 1.0, 0.0, False, "VIN",
-                    "所选通道差分（非 AIN0−AIN1）", 0.0)
+        pin = MUX_PINS.get(cfg.mux, (None, None))[0]
+        if want_abs and pin is not None:
+            return (lsb, 1.0, bias, True, pin,
+                    f"{pin} = VIN + 输入偏置", bias)
         return lsb, 1.0, 0.0, False, "VIN", "VIN = AINP − AINN", 0.0
 
     def _update_stats(self, q):
@@ -3530,7 +3640,8 @@ class App:
         if ref_line and ref_value is not None and ymin <= ref_value <= ymax:
             y = Y(ref_value)
             c.create_line(ml, y, ml + pw, y, fill="#59616f", dash=(4, 4))
-            label = (f"AIN1 = {fmt_eng(ref_value, 5)}" if mode_abs else "0 V")
+            label = (f"输入偏置 = {fmt_eng(ref_value, 5)}" if mode_abs
+                     else "0 V")
             c.create_text(ml + int(6 * s), y - int(8 * s), text=label,
                           anchor="w", fill="#8891a1", font=(FONT, 7))
 
