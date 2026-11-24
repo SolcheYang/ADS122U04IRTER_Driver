@@ -11,6 +11,13 @@ import sys
 import time
 from pathlib import Path
 
+# Windows CI consoles may use cp1252; never let a Chinese log line crash tests.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import ads122u04_tool as m
 
