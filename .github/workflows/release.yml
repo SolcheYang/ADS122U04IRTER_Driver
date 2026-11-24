@@ -1,0 +1,48 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'V*'
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyserial pyinstaller
+
+      - name: Self tests
+        run: |
+          python src/ads122u04_tool.py --selftest
+          python _tests/fake_serial_test.py
+
+      - name: Build tagged release
+        run: python tools/build.py --release
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ADS122U04_ADC_Tool.exe
+            dist/latest.json
+          body_path: dist/release_notes.md
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

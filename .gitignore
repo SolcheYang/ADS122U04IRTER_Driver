@@ -1,0 +1,26 @@
+# build output
+build/
+dist/
+*.spec
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# generated metadata
+src/build_info.json
+
+# runtime data (existing tracked samples remain tracked)
+data/*
+_tests/_data/
+
+# updater artifacts
+*.bak
+*.new
+*.restore
+.ads122u04_write_test
+
+# local executable copies (the repo may still track the historical exe)
+ADS122U04_ADC_Tool.exe

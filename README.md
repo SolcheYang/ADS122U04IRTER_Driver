@@ -1,7 +1,9 @@
-# ADS122U04 串口采集工具 v1.0.0
+# ADS122U04 串口采集工具
 
 Windows 图形化采集与分析软件，用于 **TI ADS122U04**（24 位、4 通道、UART 接口 ΔΣ ADC）。
 默认测量 **AIN0 − AIN1** 差分信号，并把 **AIN1 视为信号的直流偏置**，可实时换算 AIN0 绝对电压、显示波形并保存原始码流。
+
+版本号由 **git tag** 生成；发布包通过 GitHub Release 分发，程序启动时检查更新，发现新 tag 后弹窗强制更新并显示 **tag commit**。
 
 ![界面截图](docs/screenshot.png)
 
@@ -28,6 +30,12 @@ Windows 图形化采集与分析软件，用于 **TI ADS122U04**（24 位、4 �
   - 帧率、最新/最小/最大/峰峰值/均值、丢帧与错误统计
 - **测量范围计算**：输入 REFP、AIN1（偏置）、AVDD，实时计算 VREF、满量程、1 LSB、PGA 绝对输入窗口、AIN0 可用范围，并给出图形化范围条
 - 内置**模拟器**（无硬件演示），用于检查界面、波形和文件保存
+- **git tag 版本号 + GitHub Release 自动更新**：
+  - 版本/commit 在建包时从 git tag 注入
+  - 启动检查 `latest.json`，发现新 tag 时模态弹窗（显示 tag、commit SHA、提交说明、日期、发布说明）
+  - 强制更新：只能“立即更新”或“退出程序”，不能稍后
+  - 下载后 SHA-256 校验、更新助手替换、自动重启、启动健康检查与 `.bak` 回滚
+- 手动“检查更新”按钮；离线时自动跳过检查，不影响采集
 - 高 DPI 自适应、深色界面、设置自动保存
 
 ---
@@ -36,22 +44,29 @@ Windows 图形化采集与分析软件，用于 **TI ADS122U04**（24 位、4 �
 
 ```
 E:\ADS122U04_Tool\
-├─ ADS122U04_ADC_Tool.exe      ← 主程序（绿色单文件，无需安装）
-├─ data\                       ← 默认数据保存目录
+├─ src\
+│  ├─ ads122u04_tool.py        ← 主程序源码
+│  └─ updater.py               ← 更新检查 / 下载 / 自替换 / 健康检查
+├─ tools\build.py              ← 从 git tag 生成版本并打包
+├─ .github\workflows\release.yml ← tag 触发的 Release 构建
+├─ build.cmd                   ← 一键打包包装器
+├─ _tests\fake_serial_test.py  ← 无硬件协议/采集测试
 ├─ docs\
 │  ├─ screenshot.png
 │  └─ ADS122U04_SBAS752B_datasheet.pdf
-├─ src\ads122u04_tool.py       ← 完整源码（可重新编译）
-├─ _tests\fake_serial_test.py  ← 无硬件协议/采集测试
-├─ build.cmd                   ← 一键重新打包
-├─ version_info.txt
-└─ icon.ico
+├─ icon.ico
+├─ data\                       ← 默认数据保存目录
+├─ ADS122U04_ADC_Tool.exe      ← 历史本地 exe（发布版以 Release 资产为准）
+├─ build\                      ← 生成，已被 .gitignore 忽略
+└─ dist\                       ← 生成，包含 exe / latest.json / release_notes.md
 ```
 
 - 数据默认保存在 **exe 所在目录的 `data` 子目录**；可在界面中改选其他目录。
 - 串口、波特率、配置、范围参数等保存在：
   `%APPDATA%\ADS122U04_Tool\settings.json`
-- 删除该 JSON 即可恢复出厂默认界面参数（不影响数据文件）。
+- 更新日志 / 启动标记 / 下载缓存：`%LOCALAPPDATA%\ADS122U04_Tool\`
+- 删除 settings JSON 即可恢复出厂默认界面参数（不影响数据文件）。
+- 仓库按 tag 发布 exe；建议不要把 exe 和采集数据文件提交到 git，统一从 GitHub Releases 下载。
 
 ---
 
@@ -242,7 +257,94 @@ CSV 列：
 
 ---
 
-## 8. 模拟器（无硬件）
+## 8. 自动更新与版本发布
+
+### 8.1 版本号来源
+
+- tag 规范：`V1.2.3`（也接受小写 `v1.2.3`）。
+- `tools/build.py` 在打包时执行 `git describe --tags`，把 `version / tag / commit / tag commit message` 写入 `build_info.json`，同时生成 Windows 版本资源。
+- exe 内显示当前版本和 commit 短哈希；标题、页脚、更新弹窗都使用这份信息。
+- 没有 tag 的本地构建标记为开发构建，**跳过启动更新检查**，避免开发时被强制更新打断。
+
+### 8.2 发布流程
+
+1. 提交并推送应用代码到当前分支（本仓库为 `master`）：
+   ```bat
+   git push origin master
+   ```
+2. 打 annotated tag，把发布说明写进 tag：
+   ```bat
+   git tag -a V1.0.1 -m "修复帧同步；改进高数据速率稳定性"
+   git push origin V1.0.1
+   ```
+3. GitHub Actions（`.github/workflows/release.yml`）在 tag 上执行：
+   - `python tools/build.py --release`
+   - 构建 `dist/ADS122U04_ADC_Tool.exe`
+   - 生成 `dist/latest.json`（含 tag、commit、SHA-256、大小、下载 URL、强制标志）
+   - 创建 GitHub Release 并上传两个文件
+4. 客户端启动时读取：
+   ```
+   https://github.com/SolcheYang/ADS122U04IRTER_Driver/releases/latest/download/latest.json
+   ```
+   与当前版本比较；有新版本则弹窗。
+
+> **首次升级注意：** 现有的 `v1.0.0` exe 还没有更新器。需要手动安装一次 `V1.0.1` 发布包；从 `V1.0.1` 开始，后续 tag 才会自动提示并强制更新。
+>
+> 工作流文件必须在被打 tag 的提交里；先提交/推送工作流，再打新 tag。
+> 当前 GitHub 默认分支是 `main`（只有 LICENSE/README），应用代码在 `master`；建议把 `master` 设为默认分支或合并，避免首页/文档显示不一致。
+
+### 8.3 强制更新弹窗
+
+程序启动后会在后台检查更新，不阻塞界面。发现新 tag 时：
+
+- 弹出模态窗口，主界面不可操作
+- 显示当前版本 → 最新 tag / 版本
+- 显示 **tag commit**：短 SHA、完整 SHA、提交说明、提交时间
+- 显示发布说明和下载大小
+- 按钮只有 **立即更新** 和 **退出程序**；没有“稍后”
+- 下载失败可“重试更新”或“手动下载”；关闭窗口等于退出程序
+
+### 8.4 更新执行过程
+
+1. 下载到 `%LOCALAPPDATA%\ADS122U04_Tool\updates\...`
+2. 校验文件大小与 `latest.json` 中的 SHA-256
+3. 启动新版本 exe 的 `--apply-update` 模式
+4. 等待旧进程以及 PyInstaller onefile 的 bootloader 父进程退出
+5. 备份旧 exe 为 `ADS122U04_ADC_Tool.exe.bak`，替换为下载的新 exe
+6. 启动新 exe；新 exe 写 `startup.json` 启动标记
+7. 更新助手确认新版本成功启动；否则恢复 `.bak`
+
+日志：`%LOCALAPPDATA%\ADS122U04_Tool\update.log`
+手动回滚：把同目录的 `ADS122U04_ADC_Tool.exe.bak` 改回 `ADS122U04_ADC_Tool.exe`。
+
+正式发布前建议在测试机用坏包/错误版本（或人为让新版本启动失败）验证一次自动回滚路径。
+
+> 自动替换要求 exe 所在目录可写。若程序放在 `Program Files` 等受保护目录，会提示失败并提供手动下载；请放在用户可写目录运行。
+
+### 8.5 离线与手动检查
+
+- 更新检查时机：程序启动后、运行中每 30 分钟、以及手动点击“检查更新”。
+- 更新检查失败（断网、GitHub 不可达、超时）时**不会阻止程序使用**，只记录日志。
+- 一旦成功发现更新的 tag，则必须更新或退出；如果此时正在采集，采集会先停止。
+- 界面左下角有 **检查更新** 按钮，可手动重试。
+- 测试/镜像可用环境变量覆盖清单地址：
+  ```bat
+  set ADS122U04_UPDATE_URL=http://127.0.0.1:8765/latest.json
+  ```
+  开发时可用 `--no-update-check` 跳过启动检查。
+
+### 8.6 安全说明（重要）
+
+- 更新清单和 exe 通过 GitHub HTTPS 获取，exe 用清单中的 SHA-256 校验，能防止传输损坏/中间篡改。
+- 但 `latest.json` 本身没有签名；能控制 GitHub 仓库/Release 的人可以发布新版本。正式产品建议：
+  - 给 exe 做 Windows 代码签名（Authenticode）
+  - 或对 `latest.json` 做离线私钥签名（Ed25519），客户端内置公钥验证
+- 客户端“强制更新”属于使用策略，无法阻止用户断网或修改 exe；如果需要强管控，需要服务端授权/心跳。
+- 仓库是公开的，不要把任何 token/密钥放进客户端或 `latest.json`。
+
+---
+
+## 9. 模拟器（无硬件）
 
 在串口列表选择 **“模拟器 — 无硬件演示”** → 连接 → 开始采集。
 程序会合成 24 位波形，并走完全相同的帧编码、解析、CSV/原始流保存路径，适合演示和验证界面。
@@ -250,7 +352,7 @@ CSV 列：
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
 **找不到串口 / 打开失败**
 - 安装 USB-UART 驱动；关闭占用该 COM 口的其他软件（串口助手、调试器）。
@@ -284,22 +386,31 @@ CSV 列：
 
 ---
 
-## 10. 重新编译
+## 11. 重新编译
 
-环境：Windows + Python 3.9+（含 tkinter）+ pyserial + PyInstaller。
+环境：Windows + Python 3.10+（含 tkinter）+ pyserial + PyInstaller（CI 使用 3.12）。
 
 ```bat
 pip install pyserial pyinstaller
 build.cmd
 ```
 
-或手动：
+`build.cmd` 实际调用 `tools\build.py`：
 
-```bat
-python -m PyInstaller --noconfirm --clean --onefile --noconsole ^
-  --name ADS122U04_ADC_Tool --icon icon.ico --add-data "icon.ico;." ^
-  --version-file version_info.txt src\ads122u04_tool.py
+- 开发构建（无 tag/有未提交修改）：`python tools\build.py`
+- 正式发布：`python tools\build.py --release`
+  要求 HEAD 正好在 `vX.Y.Z` tag 上且工作区干净
+- 本地测试用（**不要用于发布**）：`python tools\build.py --force-release --version 1.0.1`
+
+发布构建会生成：
+
 ```
+dist\ADS122U04_ADC_Tool.exe
+dist\latest.json
+dist\release_notes.md
+```
+
+并把 `build_info.json` 注入 exe。
 
 自检（协议、帧解析、量程公式）：
 
@@ -307,17 +418,26 @@ python -m PyInstaller --noconfirm --clean --onefile --noconsole ^
 python src\ads122u04_tool.py --selftest
 ```
 
-无硬件端到端测试（模拟 ADS122U04 串口设备，验证写寄存器/回读、连续/单次、计数器/CRC/反码、原始流与 CSV）：
+无硬件协议/采集测试：
 
 ```bat
 python _tests\fake_serial_test.py
 ```
 
+更新器测试可搭一个本地 HTTP 清单，并设置 `ADS122U04_UPDATE_URL`；正式发布前请在 staging Release 上完整走一遍下载、校验、替换和重启。
+
 ---
 
-## 11. 验证说明与免责声明
+## 12. 验证说明与免责声明
 
 - 已验证：寄存器编码、命令序列、帧解析（计数器 / 反码 / CRC-16）、自动重同步、量程公式、GUI 交互、波形与文件保存、exe 打包与启动、模拟器端到端流程。
+- 已用本地 `latest.json` + 本地 HTTP 服务验证：
+  - 强制更新弹窗与 tag commit 显示
+  - 新版本下载、SHA-256 校验
+  - PyInstaller bootloader 等待、exe 替换、自动重启
+  - 启动标记/版本健康检查、更新日志、`.bak` 备份
+  - 成功路径已完整验证；失败回滚路径建议在 staging 注入坏包再验证一次
+- **尚未通过真实 GitHub Release 走完整发布流程**（仓库目前只有 V1.0.0 tag，尚未创建 Release）；首次打新 tag 后请观察 Actions 与 Release 资产。
 - **本软件在构建环境中没有连接真实 ADS122U04 硬件进行实测。** 首次使用请从低数据速率（如 20 SPS）开始，先确认“一键设置”回读 5/5，再逐步提高速率。
 - 请以 TI 数据手册 **SBAS752B** 为准（已附带：`docs/ADS122U04_SBAS752B_datasheet.pdf`）。
 - 使用本工具造成的硬件损坏、数据损失等由使用者自行承担。
