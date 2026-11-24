@@ -1,0 +1,51 @@
+{
+  "tool": "ADS122U04 串口采集工具",
+  "version": "1.0.0",
+  "created": "2026-11-24T14:17:50",
+  "port": "SIM",
+  "baud": 115200,
+  "device_config": {
+    "mux": 0,
+    "gain": 16,
+    "data_rate": 175,
+    "turbo": false,
+    "continuous": true,
+    "vref_code": 0,
+    "pga_bypass": false,
+    "dcnt": true,
+    "integrity": 0,
+    "auto": true,
+    "registers_hex": [
+      "0x08",
+      "0x68",
+      "0x40",
+      "0x01",
+      "0x00"
+    ],
+    "description": "AIN0 − AIN1   （差分，默认） · 增益×16 · 175 SPS · 连续 · 内部 2.048 V · PGA 使能 · 计数开 · 关闭 · AUTO"
+  },
+  "frame": {
+    "length": 4,
+    "description": "4 B/样本（计数器 1 B + 数据 3 B，数据字 LSB first）"
+  },
+  "range": {
+    "refp_V": 2.048,
+    "ain1_V": 1.65,
+    "avdd_V": 3.3,
+    "vref_V": 2.048,
+    "gain": 16,
+    "full_scale_V": 0.128,
+    "lsb_V": 1.52587890625e-08,
+    "abs_input_V": [
+      0.392,
+      2.9079999999999995
+    ],
+    "usable_ain0_V": [
+      1.5219999999999998,
+      1.778
+    ],
+    "valid": true,
+    "message": "PGA 使能，绝对输入窗口随增益收窄"
+  },
+  "note": "CSV 中的 vin = 原始码 × LSB；AIN0−AIN1 通道下 ain0 = vin + AIN1；反向通道 AIN1−AIN0 下 ain0 = AIN1 − vin；其他通道 ain0 留空。"
+}
