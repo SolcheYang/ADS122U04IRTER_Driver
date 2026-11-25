@@ -235,6 +235,7 @@ def main():
             "--icon", str(ROOT / "icon.ico"),
             "--add-data", f"{build_info_path}{os.pathsep}.",
             "--add-data", f"{ROOT / 'icon.ico'}{os.pathsep}.",
+            "--hidden-import", "PIL.ImageGrab",
             "--version-file", str(version_file),
             "--distpath", str(DIST),
             "--workpath", str(BUILD / "pyinstaller"),

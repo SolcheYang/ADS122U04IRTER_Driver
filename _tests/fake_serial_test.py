@@ -209,6 +209,13 @@ def run_case(name, cfg, record=True, run_secs=1.2, folder=None, sample_meta=None
     meta = dict(sample_meta or {})
     meta.setdefault("lsb", 2.048 / 16 / (1 << 23))
     meta.setdefault("ain1", 1.65)
+    if record and "outputs" not in meta:
+        base = "MagSensor_test"
+        meta["outputs"] = {
+            "raw": str(folder / f"{base}_raw.bin"),
+            "decoded": str(folder / f"{base}_samples.csv"),
+            "analog": str(folder / f"{base}_analog.csv"),
+        }
     w.start_acq(cfg, record, str(folder) if record else ".", meta)
     assert wait_until(lambda: w.get_state()["streaming"], desc="streaming")
     time.sleep(run_secs)
@@ -225,15 +232,25 @@ def run_case(name, cfg, record=True, run_secs=1.2, folder=None, sample_meta=None
     if record:
         raws = list(folder.glob("*_raw.bin"))
         csvs = list(folder.glob("*_samples.csv"))
+        analogs = list(folder.glob("*_analog.csv"))
         jsons = list(folder.glob("*_config.json"))
-        assert len(raws) == len(csvs) == len(jsons) == 1, (raws, csvs, jsons)
+        assert len(raws) == len(csvs) == len(analogs) == len(jsons) == 1, \
+            (raws, csvs, analogs, jsons)
         raw = raws[0].read_bytes()
         with open(csvs[0], encoding="utf-8-sig") as f:
             rows = list(csv.reader(f))
+        with open(analogs[0], encoding="utf-8-sig") as f:
+            arows = list(csv.reader(f))
         print("raw bytes:", len(raw), "csv rows:", len(rows) - 1,
+              "analog rows:", len(arows) - 1,
               "frame len:", cfg.frame_len,
               "partial tail:", len(raw) % cfg.frame_len)
-        assert rows and rows[0][7:] == ["x_value", "formula_value"], rows[0]
+        assert rows and rows[0] == [
+            "index", "t_s", "host_time_s", "counter", "channel",
+            "code", "vin_V", "ain_V"], rows[0]
+        assert arows and arows[0] == [
+            "index", "t_s", "host_time_s", "channel", "f"], arows[0]
+        assert len(arows) == len(rows), (len(arows), len(rows))
         # A stop can leave a partial frame in the raw stream; complete frames
         # must still match the decoded CSV row count.
         # Re-decode the saved raw stream independently.
@@ -250,18 +267,18 @@ def run_case(name, cfg, record=True, run_secs=1.2, folder=None, sample_meta=None
             assert all(g == 1 for g in gaps), set(gaps)
         # check code / volts consistency on the first row
         if len(rows) > 1:
-            code = int(rows[1][4])
+            code = int(rows[1][5])
             expect_v = code * float(meta["lsb"])
-            assert abs(float(rows[1][5]) - expect_v) < 1e-9
-            assert abs(float(rows[1][6]) - (expect_v + meta["ain1"])) < 1e-9
+            assert abs(float(rows[1][6]) - expect_v) < 1e-9
+            assert abs(float(rows[1][7]) - (expect_v + meta["ain1"])) < 1e-9
+            assert int(rows[1][4]) == cfg.mux
             # nominal sample time = index / data rate
             assert abs(float(rows[1][1]) - 0.0) < 1e-9
             if len(rows) > 2:
                 assert abs(float(rows[2][1]) - 1.0 / cfg.data_rate) < 1e-6
-            # default formulas: x = t, f = ain0
-            assert rows[1][7] and rows[1][8]
-            assert abs(float(rows[1][7]) - float(rows[1][1])) < 1e-5
-            assert abs(float(rows[1][8]) - float(rows[1][6])) < 1e-6
+            # default formula: f = ain
+            assert arows[1][4]
+            assert abs(float(arows[1][4]) - float(rows[1][7])) < 1e-6
         print("files OK")
     w.shutdown()
     print("PASS", name)
