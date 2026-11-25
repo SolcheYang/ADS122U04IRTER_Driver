@@ -46,7 +46,7 @@ MagSensor 是面向 **TI ADS122U04**（24 位、4 通道、UART 接口 ΔΣ ADC�
 ## 2. 文件与路径
 
 ```
-E:\ADS122U04_Tool\
+E:\MagSensor\
 ├─ src\
 │  ├─ ads122u04_tool.py        ← 主程序源码
 │  ├─ formula.py               ← C 表达式解析/求值（公式波形）
@@ -60,9 +60,8 @@ E:\ADS122U04_Tool\
 │  └─ ADS122U04_SBAS752B_datasheet.pdf
 ├─ icon.ico
 ├─ data\                       ← 默认数据保存目录
-├─ ADS122U04_ADC_Tool.exe      ← 历史本地 exe（旧版本，发布版以 Release 资产为准）
 ├─ build\                      ← 生成，已被 .gitignore 忽略
-└─ dist\                       ← 生成，包含 MagSensor.exe / latest.json / release_notes.md
+└─ dist\                       ← 生成，包含最新 MagSensor.exe / latest.json / release_notes.md
 ```
 
 - 数据默认保存在 **exe 所在目录的 `data` 子目录**；可在界面中改选其他目录。
@@ -367,8 +366,8 @@ CSV 列：
    ```
 2. 打 annotated tag，把发布说明写进 tag：
    ```bat
-   git tag -a V1.1.0 -m "MagSensor：公式波形、Y 轴缩放/框选、MagSensor 品牌"
-   git push origin V1.1.0
+   git tag -a V1.2.1 -m "MagSensor：项目/仓库更名，仅保留最新程序"
+   git push origin V1.2.1
    ```
 3. GitHub Actions（`.github/workflows/release.yml`）在 tag 上执行：
    - `python tools/build.py --release`
@@ -377,14 +376,14 @@ CSV 列：
    - 创建 GitHub Release 并上传两个文件
 4. 客户端启动时读取：
    ```
-   https://github.com/SolcheYang/ADS122U04IRTER_Driver/releases/latest/download/latest.json
+   https://github.com/SolcheYang/MagSensor/releases/latest/download/latest.json
    ```
    与当前版本比较；有新版本则弹窗。
 
 > **首次升级注意：** `v1.0.0` 的 exe 没有更新器。需要手动安装一次 `V1.0.1` 发布包；从 `V1.0.1` 开始，后续 tag（包括 MagSensor 版本）会自动提示并强制更新。MagSensor 版本的 Release 资产名改为 `MagSensor.exe`，旧客户端会按清单 URL 下载并替换。
 >
 > 工作流文件必须在被打 tag 的提交里；先提交/推送工作流，再打新 tag。
-> 当前 GitHub 默认分支是 `main`（只有 LICENSE/README），应用代码在 `master`；建议把 `master` 设为默认分支或合并，避免首页/文档显示不一致。
+> 仓库已更名为 **SolcheYang/MagSensor**，默认分支为 `master`（旧仓库 URL 由 GitHub 自动重定向）。
 
 ### 9.3 强制更新弹窗
 
@@ -532,7 +531,7 @@ python _tests\fake_serial_test.py
   - PyInstaller bootloader 等待、exe 替换、自动重启
   - 启动标记/版本健康检查、更新日志、`.bak` 备份
   - 成功路径已完整验证；失败回滚路径建议在 staging 注入坏包再验证一次
-- **MagSensor 版本发布流程**：推送 `V1.1.0` tag 后由 GitHub Actions 构建并创建 Release；请以 Actions 结果和 Release 资产（`MagSensor.exe` / `latest.json`）为准。
+- **MagSensor 版本发布流程**：推送 `V1.2.1` tag 后由 GitHub Actions 构建并创建 Release；请以 Actions 结果和 Release 资产（`MagSensor.exe` / `latest.json`）为准。
 - **本软件在构建环境中没有连接真实 ADS122U04 硬件进行实测。** 首次使用请从低数据速率（如 20 SPS）开始，先确认“一键设置”回读 5/5，再逐步提高速率。
 - 请以 TI 数据手册 **SBAS752B** 为准（已附带：`docs/ADS122U04_SBAS752B_datasheet.pdf`）。
 - 使用本工具造成的硬件损坏、数据损失等由使用者自行承担。

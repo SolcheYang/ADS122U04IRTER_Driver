@@ -285,7 +285,7 @@ APP_TAG = str(BUILD_INFO.get("tag") or f"v{APP_VERSION}")
 APP_COMMIT = str(BUILD_INFO.get("commit") or "")
 APP_COMMIT_SHORT = str(BUILD_INFO.get("commit_short") or APP_COMMIT[:7])
 IS_RELEASE_BUILD = bool(BUILD_INFO.get("release"))
-UPDATE_REPO = str(BUILD_INFO.get("repo") or "SolcheYang/ADS122U04IRTER_Driver")
+UPDATE_REPO = str(BUILD_INFO.get("repo") or "SolcheYang/MagSensor")
 
 
 # ---------------------------------------------------------------------------

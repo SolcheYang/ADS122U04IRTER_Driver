@@ -22,5 +22,5 @@ _tests/_data/
 *.restore
 .ads122u04_write_test
 
-# local executable copies (the repo may still track the historical exe)
+# local executable copies (release builds live in dist/, ignored above)
 MagSensor.exe
